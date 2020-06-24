@@ -6,17 +6,14 @@ import pandas as pd
 from PIL import Image
 from PIL.Image import fromarray
 from skimage.transform import resize
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score
 
 import torch
 import torchvision
 from torchvision import datasets, transforms, models
 from torch.utils.data import DataLoader, Dataset
 import torch.nn as nn
-from torchvision import transforms
-from torchvision import datasets, transforms, models
-from torch.utils.data import DataLoader, Dataset
-import torch.nn as nn
-from torchvision import transforms
 import math
 from torch.optim.optimizer import Optimizer, required
 import torch.nn.functional as F
@@ -118,7 +115,7 @@ class FocalLoss(nn.Module):
 img_dir = '/nfs/project/richard/COVID/KCH_CXR_JPG'
 labels = 'KCH_CXR_JPG.csv'
 encoder = 'efficientnet-b0'
-EPOCHS = 5
+EPOCHS = 11
 bs = 128
 input_size = (256,256)
 SAVE = False
@@ -140,6 +137,11 @@ print("Number of images:", df.shape[0])
 print("Died:", df[df.Died == 1].shape[0])
 print("Survived:", df[df.Died == 0].shape[0])
 
+# Train / Val split
+train_df, val_df = train_test_split(df, stratify=df.Died, test_size=0.10)
+train_df.reset_index(drop=True, inplace=True)
+val_df.reset_index(drop=True, inplace=True)
+
 
 mean = [0.485, 0.456, 0.406]
 std = [0.229, 0.224, 0.225]
@@ -150,8 +152,12 @@ transform = transforms.Compose([
                             ])
 
 
-train_dataset = ImageDataset(img_dir, df, transform)
+
+train_dataset = ImageDataset(img_dir, train_df, transform)
 train_loader = DataLoader(train_dataset, batch_size=bs, num_workers=8, shuffle=True)
+
+val_dataset = ImageDataset(img_dir, val_df, transform)
+val_loader = DataLoader(val_dataset, batch_size=bs, num_workers=8)
 
 
 model = Model(encoder)
@@ -209,5 +215,39 @@ for epoch in range(EPOCHS):
         MODEL_PATH = os.path.join(SAVE_PATH, ('fold_%d_epoch_%d.pth' % (fold, epoch)))
         print(MODEL_PATH)
         torch.save(model.state_dict(), MODEL_PATH)
+
+
+    print('Validation step')
+    model.eval()
+    running_loss = 0
+    correct = 0
+    total = 0
+    res_id = []
+    res_prob = []
+    res_label = []
+    with torch.no_grad():
+        for images, names, labels in val_loader:
+            images = images.cuda()
+            labels = labels.cuda()
+            labels = labels.unsqueeze(1).float()
+            out = model(images)
+            loss = criterion(out.data, labels)
+
+            running_loss += loss.item()
+
+            total += labels.size(0)
+            out = torch.sigmoid(out)
+            correct += ((out > 0.5).int() == labels).sum().item()
+
+            res_id += names
+            res_prob += out.cpu().numpy().tolist()
+            res_label += labels.cpu().numpy().tolist()
+
+    acc = correct/total
+    y_true = np.array(res_label)
+    y_scores = np.array(res_prob)
+    auc = roc_auc_score(y_true, y_scores)
+    print("Epoch: {}, Loss: {}, Test Accuracy: {}, AUC: {}\n".format(epoch, running_loss, round(acc, 4), auc))
+
 
 print('END')
