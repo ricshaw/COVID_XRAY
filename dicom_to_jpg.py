@@ -5,8 +5,13 @@ import os
 import cv2
 from pathlib import Path
 
+print(pd.__version__)
 
 labels = pd.read_csv('KCH_CXR_labels.csv')
+labels = labels.sort_values('AccessionID')
+print(labels.shape)
+
+labels = labels.drop_duplicates(subset=['AccessionID'], ignore_index=True)
 print(labels.shape)
 
 PATH = '/nfs/project/covid/CXR/KCH_CXR'
@@ -26,10 +31,33 @@ for i, name in enumerate(labels.AccessionID):
     img_dir = os.path.join(PATH, name)
     files = [f for f in Path(img_dir).rglob('*.dcm')]
     #print(files)
+    #if i > 100:
+    #    break
 
     for f in files:
-        print(os.fspath(f.absolute()))
+        #print(os.fspath(f.absolute()))
         ds = pydicom.dcmread(f)
+        #print(ds)
+
+        if "AcquisitionDateTime" in ds:
+            datetime = ds.AcquisitionDateTime.split('.')[0]
+        elif "ContributionDateTime" in ds:
+            datetime = ds.ContributionDateTime.split('.')[0]
+        year = datetime[:4]
+        month = datetime[4:6]
+        day = datetime[6:8]
+        time = datetime[8::]
+        #print(year, month, day, time)
+        fname = name + '_' + datetime
+
+        acc = labels.AccessionID[i]
+        ext = labels.Examination_Title[i]
+        age = labels.Age[i]
+        gen = labels.Gender[i]
+        sym = labels.SymptomOnset_DTM[i]
+        dtm = labels.Death_DTM[i]
+        ddd = labels.Died[i]
+
         try:
             img = ds.pixel_array.astype(np.float32)
             img -= img.min()
@@ -37,22 +65,24 @@ for i, name in enumerate(labels.AccessionID):
             img = np.uint8(255.0*img)
             print(img.shape)
 
-            name = name + '_' + ds.AcquisitionDateTime.split('.')[0]
-            save_name = os.path.join(save_path, (name + '.jpg'))
+            save_name = os.path.join(save_path, (fname + '.jpg'))
             print(save_name)
             cv2.imwrite(save_name, img)
 
-            Filename.append(name)
-            AccessionID.append(labels.AccessionID[i])
-            Examination_Title.append(labels.Examination_Title[i])
-            Age.append(labels.Age[i])
-            Gender.append(labels.Gender[i])
-            SymptomOnset_DTM.append(labels.SymptomOnset_DTM[i])
-            Death_DTM.append(labels.Death_DTM[i])
-            Died.append(labels.Died[i])
+            Filename.append(fname)
+            AccessionID.append(acc)
+            Examination_Title.append(ext)
+            Age.append(age)
+            Gender.append(gen)
+            SymptomOnset_DTM.append(sym)
+            Death_DTM.append(dtm)
+            Died.append(ddd)
+            print(len(Filename), len(AccessionID), len(Died))
 
         except:
             print('Cannot load image')
+
+print(len(Filename), len(AccessionID), len(Died))
 
 df = pd.DataFrame({'Filename':Filename,
                    'AccessionID':AccessionID,
