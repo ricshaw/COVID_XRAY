@@ -1,13 +1,18 @@
 import numpy as np
+import matplotlib
 import matplotlib.pyplot as plt
 import os
 #import pydicom
 import pandas as pd
 from PIL import Image
 from PIL.Image import fromarray
+from skimage import color
 from skimage.transform import resize
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, average_precision_score
+from sklearn.metrics import roc_curve, auc
+from sklearn.metrics import precision_recall_curve
+from sklearn.metrics import plot_precision_recall_curve
 
 import torch
 import torchvision
@@ -20,7 +25,20 @@ import torch.nn.functional as F
 
 import albumentations as A
 from efficientnet_pytorch import EfficientNet
+from focal_loss import sigmoid_focal_loss, sigmoid_focal_loss_star
 
+from torch.utils.tensorboard import SummaryWriter
+
+from captum.attr import (
+    GradientShap,
+    DeepLift,
+    DeepLiftShap,
+    IntegratedGradients,
+    LayerConductance,
+    NeuronConductance,
+    NoiseTunnel,
+    Occlusion
+)
 
 
 def default_image_loader(path):
@@ -44,6 +62,10 @@ def dicom_image_loader(path):
     img = np.uint8(255.0*img)
     img = Image.fromarray(img).convert("RGB")
     return img
+
+
+def image_normaliser(some_image):
+    return 1 * (some_image - torch.min(some_image)) / (torch.max(some_image) - torch.min(some_image))
 
 
 class ImageDataset(Dataset):
@@ -130,13 +152,19 @@ class FocalLoss(nn.Module):
 
 ## Config
 labels = '/nfs/home/richard/COVID_XRAY/folds.csv'
-encoder = 'efficientnet-b0'
-EPOCHS = 11
+encoder = 'efficientnet-b3'
+EPOCHS = 75
 bs = 32
-input_size = (256,256)
+input_size = (448,448)
 FOLDS = 5
+alpha = 0.75
+gamma = 2.0
+OCCLUSION = False
 SAVE = False
 SAVE_PATH = ''
+
+log_name = './runs/' + encoder + '-bs%d-%d-2' % (bs, input_size[0])
+writer = SummaryWriter(log_dir=log_name)
 
 ## Load labels
 df = pd.read_csv(labels)
@@ -166,11 +194,11 @@ A_transform = A.Compose([
                                   A.OpticalDistortion(interpolation=3, p=0.1),
                                   A.GridDistortion(interpolation=3, p=0.1),
                                   A.IAAPiecewiseAffine(p=0.5),
-                                 ], p=0.1),
+                                 ], p=0.05),
                          A.OneOf([
                                   A.CLAHE(clip_limit=2),
                                   A.IAASharpen(),
-                                  A.IAAEmboss(),
+                                  #A.IAAEmboss(),
                                   A.RandomBrightnessContrast(),
                                  ], p=1),
                          A.RandomGamma(p=1),
@@ -199,6 +227,8 @@ print('\nStarting training!')
 
 val_preds = []
 val_labels = []
+val_names = []
+val_auc = []
 
 for fold in range(FOLDS):
     print('\nFOLD', fold)
@@ -225,9 +255,9 @@ for fold in range(FOLDS):
         print('Using', torch.cuda.device_count(), 'GPUs!')
     model = nn.DataParallel(model)
 
-    criterion = nn.BCEWithLogitsLoss()
+    #criterion = nn.BCEWithLogitsLoss()
     #criterion = FocalLoss(logits=True)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, 0.9)
 
 
@@ -247,7 +277,8 @@ for fold in range(FOLDS):
             labels = labels.cuda()
             labels = labels.unsqueeze(1).float()
             out = model(images)
-            loss = criterion(out, labels)
+            #loss = criterion(out, labels)
+            loss = sigmoid_focal_loss(out, labels, alpha=alpha, gamma=gamma, reduction="mean")
 
             optimizer.zero_grad()
             loss.backward()
@@ -258,6 +289,18 @@ for fold in range(FOLDS):
             out = torch.sigmoid(out)
             correct += ((out > 0.5).int() == labels).sum().item()
             print("iter: {}, Loss: {}".format(i, loss.item()) )
+
+        # Writing to tensorboard
+        #grid = torchvision.utils.make_grid(images)
+        #writer.add_image('images', grid, 0)
+        # Convert labels and output to grid
+        #labels_grid = torchvision.utils.make_grid(labels)
+        #rounded_output_grid = torchvision.utils.make_grid((out > 0.5).int())
+        #output_grid = torchvision.utils.make_grid(out)
+        writer.add_scalar('Loss/train', loss.item(), epoch)
+        #writer.add_image('Visuals/Labels', labels_grid, running_iter)
+        #writer.add_image('Visuals/Rounded Output', rounded_output_grid, running_iter)
+        #writer.add_image('Visuals/Output', output_grid, running_iter)
 
         print("Epoch: {}, Loss: {}, Train Accuracy: {}".format(epoch, running_loss, round(correct/total, 4)))
         if epoch % 2 == 1:
@@ -277,13 +320,15 @@ for fold in range(FOLDS):
         res_name = []
         res_prob = []
         res_label = []
+        count = 0
         with torch.no_grad():
             for images, names, labels in val_loader:
                 images = images.cuda()
                 labels = labels.cuda()
                 labels = labels.unsqueeze(1).float()
                 out = model(images)
-                loss = criterion(out.data, labels)
+                #loss = criterion(out.data, labels)
+                loss = sigmoid_focal_loss(out, labels, alpha=alpha, gamma=gamma, reduction="mean")
 
                 running_loss += loss.item()
 
@@ -291,25 +336,117 @@ for fold in range(FOLDS):
                 out = torch.sigmoid(out)
                 correct += ((out > 0.5).int() == labels).sum().item()
 
-                res_name += names
                 res_prob += out.cpu().numpy().tolist()
                 res_label += labels.cpu().numpy().tolist()
 
-                val_preds += out.cpu().numpy().tolist()
-                val_labels += labels.cpu().numpy().tolist()
+                if epoch == (EPOCHS-1):
+                    val_preds += out.cpu().numpy().tolist()
+                    val_labels += labels.cpu().numpy().tolist()
+                    val_names += names
+
+                if count == 0:
+                    oc_images = images[(labels==1).squeeze()].cuda()
+                    oc_labels = labels[(labels==1).squeeze()].cuda()
+                count += 1
 
         acc = correct/total
         y_true = np.array(res_label)
         y_scores = np.array(res_prob)
         auc = roc_auc_score(y_true, y_scores)
+        if epoch == (EPOCHS-1):
+            val_auc.append(auc)
+
+        writer.add_scalar('Loss/val', loss.item(), epoch)
+        writer.add_scalar('AUC/val', auc, epoch)
+
         print("Epoch: {}, Loss: {}, Test Accuracy: {}, AUC: {}".format(epoch, running_loss, round(acc, 4), auc))
+
+
+        ## Occlusion
+        if OCCLUSION:
+            oc = Occlusion(model)
+            x_shape = 16
+            x_stride = 8
+            #random_index = np.random.randint(images.size(0))
+            #images = images[random_index, ...][None, ...].cuda()
+            #labels = labels[random_index, ...][None, ...].cuda()
+            #oc_images = images[(labels==1).squeeze()].cuda()
+            #oc_labels = labels[(labels==1).squeeze()].cuda()
+            print('oc_images', oc_images.shape)
+            print('oc_labels', oc_labels.shape)
+            baseline = torch.zeros_like(oc_images).cuda()
+            oc_attributions = oc.attribute(oc_images, sliding_window_shapes=(3, x_shape, x_shape),
+                                        strides=(3, int(x_stride/2), int(x_stride/2)), target=0,
+                                        baselines=baseline)
+            oc_attributions = torch.abs(oc_attributions)
+            print('oc_attributions', oc_attributions.shape)
+            image_grid = torchvision.utils.make_grid(oc_images, nrow=4, normalize=True, scale_each=True)
+            #oc_attributions_grid = torchvision.utils.make_grid(oc_attributions)
+
+            oc_attributions = oc_attributions.cpu().numpy()
+            cmapper = matplotlib.cm.get_cmap('hot')
+            oc_attributions_grid = []
+            for i in range(oc_attributions.shape[0]):
+                im = np.array(oc_attributions[i,...])
+                im = np.transpose(im,[1,2,0])
+                im = color.rgb2gray(im)
+                im -= im.min()
+                im /= im.max()
+                im = cmapper(im)[...,:3]
+                im = Image.fromarray(np.uint8(255*im))
+                im = transforms.ToTensor()(im)
+                oc_attributions_grid.append(im)
+            oc_attributions_grid = torchvision.utils.make_grid(oc_attributions_grid, nrow=4, normalize=True, scale_each=True)
+
+            writer.add_image('Interpretability/Image', image_normaliser(image_grid), epoch)
+            writer.add_image('Interpretability/OC_Attributions_Died', image_normaliser(oc_attributions_grid), epoch)
 
 
 ## Totals
 val_labels = np.array(val_labels)
 val_preds = np.array(val_preds)
+val_auc = np.array(val_auc)
+print('Labels', len(val_labels), 'Preds', len(val_preds), 'AUCs', len(val_auc))
 correct = ((val_preds > 0.5).astype(int) == val_labels).sum()
 acc = correct / len(val_labels)
 auc = roc_auc_score(val_labels, val_preds)
 print("Total Accuracy: {}, AUC: {}".format(round(acc, 4), auc))
+print('AUC mean:', np.mean(val_auc), 'std:', np.std(val_auc))
+
+res_prob = [x[0] for x in res_prob]
+sub = pd.DataFrame({"Filename":val_names, "Died":val_labels.tolist(), "Pred":val_preds.tolist()})
+sub.to_csv(os.path.join(SAVE_PATH, 'preds.csv'), index=False)
+
+## Plot
+fpr, tpr, _ = roc_curve(val_labels, val_preds)
+plt.figure()
+lw = 2
+plt.plot(fpr, tpr, color='darkorange', lw=lw, label='ROC curve (area = %0.2f)' % auc)
+plt.plot([0, 1], [0, 1], color='navy', lw=lw, linestyle='--')
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('Prediction of Death - ROC')
+plt.legend(loc="lower right")
+plt.savefig('roc.png', dpi=300)
+
+
+average_precision = average_precision_score(val_labels, val_preds)
+precision, recall, thresholds = precision_recall_curve(val_labels, val_preds)
+plt.figure()
+plt.plot(recall, precision, color='darkorange', lw=lw, label='AP = %0.2f' % average_precision)
+plt.xlim([0.0, 1.0])
+plt.ylim([0.0, 1.05])
+plt.xlabel('Recall')
+plt.ylabel('Precision')
+plt.title('Prediction of Death - Precision-Recall')
+plt.legend(loc="lower right")
+plt.savefig('precision-recall.png', dpi=300)
+
+
+val_labels = [x[0] for x in val_labels]
+val_preds = [x[0] for x in val_preds]
+sub = pd.DataFrame({"Filename":val_names, "Died":val_labels, "Pred":val_preds})
+sub.to_csv(os.path.join(SAVE_PATH, 'preds.csv'), index=False)
 print('END')
