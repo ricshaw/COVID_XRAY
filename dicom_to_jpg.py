@@ -4,21 +4,23 @@ import numpy as np
 import os
 import cv2
 from pathlib import Path
+from datetime import datetime as dt
 
 print(pd.__version__)
 
 labels = pd.read_csv('KCH_CXR_labels.csv')
 labels = labels.sort_values('AccessionID')
-print(labels.shape)
+print('Labels', labels.shape)
 
 labels = labels.drop_duplicates(subset=['AccessionID'], ignore_index=True)
-print(labels.shape)
+print('Unique patients', labels.shape)
 
 PATH = '/nfs/project/covid/CXR/KCH_CXR'
-save_path = '/nfs/project/richard/COVID/KCH_CXR_JPG'
+save_path = '/nfs/project/richard/COVID/KCH_CXR_JPG2'
 
 #csv = [f for f in Path(PATH).rglob('*.dcm')]
-#print(len(csv))
+#print('Dicoms', len(csv))
+#exit(0)
 
 files = 0
 count =0
@@ -27,14 +29,15 @@ for i, name in enumerate(labels.AccessionID):
     img_dir = os.path.join(PATH, name)
     tmp = os.path.exists(img_dir)
     if not tmp:
-        print(name, tmp)
+        print('Cant find', name, tmp)
     else:
         count += 1
         csv = [f for f in Path(img_dir).rglob('*.dcm')]
         files += len(csv)
-print(count)
-print(files)
-exit(0)
+print('Matching files', count)
+print('Matching dicoms', files)
+#exit(0)
+
 
 Filename = []
 AccessionID = []
@@ -44,7 +47,6 @@ Gender = []
 SymptomOnset_DTM = []
 Death_DTM = []
 Died = []
-
 count=0
 
 for i, name in enumerate(labels.AccessionID):
@@ -54,7 +56,9 @@ for i, name in enumerate(labels.AccessionID):
     #print(files)
     #if i > 100:
     #    break
-
+    y = -1
+    month = -1
+    day = -1
     for f in files:
         #print(os.fspath(f.absolute()))
         ds = pydicom.dcmread(f)
@@ -71,13 +75,13 @@ for i, name in enumerate(labels.AccessionID):
         #print(year, month, day, time)
         fname = name + '_' + datetime
 
-        #acc = labels.AccessionID[i]
-        #ext = labels.Examination_Title[i]
-        #age = labels.Age[i]
-        #gen = labels.Gender[i]
-        #sym = labels.SymptomOnset_DTM[i]
-        #dtm = labels.Death_DTM[i]
-        #ddd = labels.Died[i]
+        acc = labels.AccessionID[i]
+        ext = labels.Examination_Title[i]
+        age = labels.Age[i]
+        gen = labels.Gender[i]
+        sym = labels.SymptomOnset_DTM[i]
+        dtm = labels.Death_DTM[i]
+        ddd = labels.Died[i]
 
         try:
             img = ds.pixel_array.astype(np.float32)
@@ -86,7 +90,7 @@ for i, name in enumerate(labels.AccessionID):
             img = np.uint8(255.0*img)
             print(img.shape)
             count += 1
-            '''
+
             save_name = os.path.join(save_path, (fname + '.jpg'))
             print(save_name)
             cv2.imwrite(save_name, img)
@@ -100,12 +104,11 @@ for i, name in enumerate(labels.AccessionID):
             Death_DTM.append(dtm)
             Died.append(ddd)
             print(len(Filename), len(AccessionID), len(Died))
-            '''
         except:
             print('Cannot load image')
 
-print(count)
-'''
+print('Total', count)
+
 print(len(Filename), len(AccessionID), len(Died))
 
 df = pd.DataFrame({'Filename':Filename,
@@ -117,8 +120,8 @@ df = pd.DataFrame({'Filename':Filename,
                    'Death_DTM':Death_DTM,
                    'Died':Died
                     })
-df.to_csv('KCH_CXR_JPG.csv')
-'''
+df.to_csv('KCH_CXR_JPG2.csv')
+
 exit(0)
 
 

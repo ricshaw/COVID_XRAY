@@ -155,7 +155,7 @@ labels = '/nfs/home/richard/COVID_XRAY/folds.csv'
 encoder = 'efficientnet-b3'
 EPOCHS = 75
 bs = 32
-input_size = (448,448)
+input_size = (512,512)
 FOLDS = 5
 alpha = 0.75
 gamma = 2.0
@@ -163,7 +163,7 @@ OCCLUSION = False
 SAVE = False
 SAVE_PATH = ''
 
-log_name = './runs/' + encoder + '-bs%d-%d-2' % (bs, input_size[0])
+log_name = './runs/' + encoder + '-bs%d-%d-tta' % (bs, input_size[0])
 writer = SummaryWriter(log_dir=log_name)
 
 ## Load labels
@@ -220,6 +220,19 @@ val_transform = transforms.Compose([
                               transforms.ToTensor(),
                               transforms.Normalize(mean, std)
                             ])
+tta_transform = transforms.Compose([transforms.Resize(input_size, 3),
+                                    transforms.Lambda(lambda image: torch.stack([
+                                                                     transforms.ToTensor()(image),
+                                                                     transforms.ToTensor()(image.rotate(90, resample=0)),
+                                                                     transforms.ToTensor()(image.rotate(180, resample=0)),
+                                                                     transforms.ToTensor()(image.rotate(270, resample=0)),
+                                                                     transforms.ToTensor()(image.transpose(method=Image.FLIP_TOP_BOTTOM)),
+                                                                     transforms.ToTensor()(image.transpose(method=Image.FLIP_TOP_BOTTOM).rotate(90, resample=0)),
+                                                                     transforms.ToTensor()(image.transpose(method=Image.FLIP_TOP_BOTTOM).rotate(180, resample=0)),
+                                                                     transforms.ToTensor()(image.transpose(method=Image.FLIP_TOP_BOTTOM).rotate(270, resample=0)),
+                                                                     ])),
+                                         transforms.Lambda(lambda images: torch.stack([transforms.Normalize(mean, std)(image) for image in images]))
+                                       ])
 
 
 ## Train
@@ -244,8 +257,8 @@ for fold in range(FOLDS):
     train_dataset = ImageDataset(train_df, train_transform, A_transform)
     train_loader = DataLoader(train_dataset, batch_size=bs, num_workers=8, shuffle=True)
 
-    val_dataset = ImageDataset(val_df, val_transform)
-    val_loader = DataLoader(val_dataset, batch_size=bs, num_workers=8)
+    val_dataset = ImageDataset(val_df, tta_transform)
+    val_loader = DataLoader(val_dataset, batch_size=int(bs/2), num_workers=8)
 
     ## Init model
     model = Model(encoder)
@@ -291,16 +304,9 @@ for fold in range(FOLDS):
             print("iter: {}, Loss: {}".format(i, loss.item()) )
 
         # Writing to tensorboard
-        #grid = torchvision.utils.make_grid(images)
-        #writer.add_image('images', grid, 0)
-        # Convert labels and output to grid
-        #labels_grid = torchvision.utils.make_grid(labels)
-        #rounded_output_grid = torchvision.utils.make_grid((out > 0.5).int())
-        #output_grid = torchvision.utils.make_grid(out)
+        grid = torchvision.utils.make_grid(images, nrow=4, normalize=True, scale_each=True)
+        writer.add_image('images', grid, epoch)
         writer.add_scalar('Loss/train', loss.item(), epoch)
-        #writer.add_image('Visuals/Labels', labels_grid, running_iter)
-        #writer.add_image('Visuals/Rounded Output', rounded_output_grid, running_iter)
-        #writer.add_image('Visuals/Output', output_grid, running_iter)
 
         print("Epoch: {}, Loss: {}, Train Accuracy: {}".format(epoch, running_loss, round(correct/total, 4)))
         if epoch % 2 == 1:
@@ -326,7 +332,14 @@ for fold in range(FOLDS):
                 images = images.cuda()
                 labels = labels.cuda()
                 labels = labels.unsqueeze(1).float()
+
+
+                ## TTA
+                batch_size, n_crops, c, h, w = images.size()
+                images = images.view(-1, c, h, w)
                 out = model(images)
+                out = out.view(batch_size, n_crops, -1).mean(1)
+
                 #loss = criterion(out.data, labels)
                 loss = sigmoid_focal_loss(out, labels, alpha=alpha, gamma=gamma, reduction="mean")
 
@@ -345,6 +358,7 @@ for fold in range(FOLDS):
                     val_names += names
 
                 if count == 0:
+                    images = images.view(batch_size, n_crops, -1)[:,0,...]
                     oc_images = images[(labels==1).squeeze()].cuda()
                     oc_labels = labels[(labels==1).squeeze()].cuda()
                 count += 1
@@ -429,7 +443,7 @@ plt.xlabel('False Positive Rate')
 plt.ylabel('True Positive Rate')
 plt.title('Prediction of Death - ROC')
 plt.legend(loc="lower right")
-plt.savefig('roc.png', dpi=300)
+plt.savefig('roc-'  + encoder + '-bs%d-%d.png' % (bs, input_size[0]), dpi=300)
 
 
 average_precision = average_precision_score(val_labels, val_preds)
@@ -442,11 +456,11 @@ plt.xlabel('Recall')
 plt.ylabel('Precision')
 plt.title('Prediction of Death - Precision-Recall')
 plt.legend(loc="lower right")
-plt.savefig('precision-recall.png', dpi=300)
+plt.savefig('precision-recall-'  + encoder + '-bs%d-%d.png' % (bs, input_size[0]), dpi=300)
 
 
 val_labels = [x[0] for x in val_labels]
 val_preds = [x[0] for x in val_preds]
 sub = pd.DataFrame({"Filename":val_names, "Died":val_labels, "Pred":val_preds})
-sub.to_csv(os.path.join(SAVE_PATH, 'preds.csv'), index=False)
+sub.to_csv(os.path.join(SAVE_PATH, 'preds-' + encoder + '-bs%d-%d.csv' % (bs, input_size[0])), index=False)
 print('END')
