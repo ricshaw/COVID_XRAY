@@ -27,6 +27,10 @@ import albumentations as A
 from efficientnet_pytorch import EfficientNet
 from focal_loss import sigmoid_focal_loss, sigmoid_focal_loss_star
 
+import sys
+sys.path.append('/nfs/home/richard/over9000')
+from over9000 import RangerLars # Over9000
+
 from torch.utils.tensorboard import SummaryWriter
 
 from captum.attr import (
@@ -155,16 +159,20 @@ labels = '/nfs/home/richard/COVID_XRAY/folds.csv'
 encoder = 'efficientnet-b3'
 EPOCHS = 75
 bs = 32
-input_size = (512,512)
+input_size = (352,352)
 FOLDS = 5
 alpha = 0.75
 gamma = 2.0
 OCCLUSION = False
 SAVE = False
-SAVE_PATH = ''
-
-log_name = './runs/' + encoder + '-bs%d-%d-tta' % (bs, input_size[0])
+SAVE_NAME = encoder + '-bs%d-%d-tta-ranger' % (bs, input_size[0])
+SAVE_PATH = '/nfs/home/richard/COVID_XRAY/' + SAVE_NAME
+log_name = './runs/' + SAVE_NAME
 writer = SummaryWriter(log_dir=log_name)
+
+if SAVE:
+    os.makedirs(SAVE_PATH, exist_ok=True)
+
 
 ## Load labels
 df = pd.read_csv(labels)
@@ -270,9 +278,11 @@ for fold in range(FOLDS):
 
     #criterion = nn.BCEWithLogitsLoss()
     #criterion = FocalLoss(logits=True)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, 0.9)
+    optimizer = RangerLars(model.parameters())
+    #optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    #scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, 0.9)
 
+    running_auc = []
 
     for epoch in range(EPOCHS):
 
@@ -309,8 +319,8 @@ for fold in range(FOLDS):
         writer.add_scalar('Loss/train', loss.item(), epoch)
 
         print("Epoch: {}, Loss: {}, Train Accuracy: {}".format(epoch, running_loss, round(correct/total, 4)))
-        if epoch % 2 == 1:
-            scheduler.step()
+        #if epoch % 2 == 1:
+        #    scheduler.step()
 
         # Save model
         if SAVE:
@@ -367,6 +377,9 @@ for fold in range(FOLDS):
         y_true = np.array(res_label)
         y_scores = np.array(res_prob)
         auc = roc_auc_score(y_true, y_scores)
+        running_auc.append(auc)
+        print('ALL AUCs', running_auc)
+        print('Best AUC', np.argmax(running_auc))
         if epoch == (EPOCHS-1):
             val_auc.append(auc)
 
