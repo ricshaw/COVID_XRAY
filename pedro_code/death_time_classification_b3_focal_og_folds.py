@@ -22,6 +22,11 @@ import argparse
 import albumentations as A
 from efficientnet_pytorch import EfficientNet
 from torch.utils.tensorboard import SummaryWriter
+import sys
+sys.path.append('/nfs/home/pedro/RangerLARS/over9000')
+from over9000 import RangerLars
+sys.path.append('/nfs/home/pedro/ImbalancedDatasetSampler/imbalanced-dataset-sampler/torchsampler')
+from imbalanced import ImbalancedDatasetSampler
 
 from captum.attr import (
     GradientShap,
@@ -211,13 +216,45 @@ elif len(labels) > 1:
 # # Exclude all entries with "Missing" Died stats
 # df = df[~df['Died'].isin(['Missing'])]
 # df['Died'] = pd.to_numeric(df['Died'])
-#
+
+# Pre-processing transforms
+mean = [0.485, 0.456, 0.406]
+std = [0.229, 0.224, 0.225]
+
+transform = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(mean, std)
+])
+
+val_transform = transforms.Compose([
+      transforms.Resize(input_size, 3),
+      transforms.ToTensor(),
+      transforms.Normalize(mean, std)
+])
+
+tta_transform = transforms.Compose([transforms.Resize(input_size, 3),
+                                    transforms.Lambda(lambda image: torch.stack([
+                                        transforms.ToTensor()(image),
+                                        transforms.ToTensor()(image.rotate(90, resample=0)),
+                                        transforms.ToTensor()(image.rotate(180, resample=0)),
+                                        transforms.ToTensor()(image.rotate(270, resample=0)),
+                                        transforms.ToTensor()(image.transpose(method=Image.FLIP_TOP_BOTTOM)),
+                                        transforms.ToTensor()(
+                                            image.transpose(method=Image.FLIP_TOP_BOTTOM).rotate(90, resample=0)),
+                                        transforms.ToTensor()(
+                                            image.transpose(method=Image.FLIP_TOP_BOTTOM).rotate(180, resample=0)),
+                                        transforms.ToTensor()(
+                                            image.transpose(method=Image.FLIP_TOP_BOTTOM).rotate(270, resample=0)),
+                                    ])),
+                                    transforms.Lambda(lambda images: torch.stack(
+                                        [transforms.Normalize(mean, std)(image) for image in images]))
+                                    ])
 # Augmentations
 A_transform = A.Compose([
                          A.Flip(p=1),
                          A.RandomRotate90(p=1),
                          A.Rotate(p=1, limit=45, interpolation=3),
-                         A.RandomResizedCrop(input_size[0], input_size[1], scale=(0.8,1.0), ratio=(0.8,1.2), interpolation=3, p=1),
+                         A.RandomResizedCrop(input_size[0], input_size[1], scale=(0.8, 1.0), ratio=(0.8, 1.2), interpolation=3, p=1),
                          A.OneOf([
                                   A.IAAAdditiveGaussianNoise(),
                                   A.GaussNoise(),
@@ -292,8 +329,13 @@ overall_val_pr_aucs = []
 class_val_roc_aucs = []
 class_val_pr_aucs = []
 
-# Find out fold and epoch
+# If pretrained then initial model file will NOT match those created here: Therefore need to account for this
+# Because won't be able to extract epoch and/ or fold from the name
 if LOAD and num_files > 0:
+    pretrained_checker = 'fold' in os.path.basename(latest_model_file)
+
+# Find out fold and epoch
+if LOAD and num_files > 0 and pretrained_checker:
     latest_epoch = int(os.path.splitext(os.path.basename(latest_model_file))[0].split('_')[2])
     latest_fold = int(os.path.splitext(os.path.basename(latest_model_file))[0].split('_')[4])
 else:
@@ -308,17 +350,29 @@ for fold in range(latest_fold, FOLDS):
     alpha = torch.FloatTensor([0.979, 0.931, 0.811, 0.279])[None, ...].cuda()
     alpha = alpha ** 0.5
     criterion = FocalLoss(logits=True)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, 0.9)
+    # Try RAdam + Lookahead
+    optimizer = RangerLars(model.parameters())
+    # Outdated
+    # optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
+    # scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, 0.9)
 
     # Specific fold writer
     writer = SummaryWriter(log_dir=os.path.join(log_dir, f'fold_{fold}'))
 
+    # for name, child in model.net.named_parameters():
+    #     print(name)
+
+    # Pretrained loading workaround
+    if arguments.mode == 'pretrained':
+        model.net._fc = nn.Linear(in_features=1536, out_features=14, bias=True)
+        print(model.net._fc)
+
     # Load fold specific model
     if LOAD and num_files > 0 and arguments.mode == 'pretrained':
         # Get model file specific to fold
-        loaded_model_file = f'model_epoch_{loaded_epoch}_fold_{fold}.pth'
-        checkpoint = torch.load(os.path.join(SAVE_PATH, loaded_model_file), map_location=torch.device('cuda:0'))
+        # loaded_model_file = f'model_epoch_{loaded_epoch}_fold_{fold}.pth'
+        # checkpoint = torch.load(os.path.join(SAVE_PATH, loaded_model_file), map_location=torch.device('cuda:0'))
+        checkpoint = torch.load(latest_model_file, map_location=torch.device('cuda:0'))
         # Adjust key names
         keys_list = checkpoint['model_state_dict'].keys()
         new_dict = checkpoint['model_state_dict'].copy()
@@ -327,14 +381,9 @@ for fold in range(latest_fold, FOLDS):
             del new_dict[name]
         model.load_state_dict(new_dict)
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        # Get the validation entries from previous folds!
-        val_preds = checkpoint['val_preds']
-        val_labels = checkpoint['val_labels']
-        overall_val_roc_aucs = checkpoint['overall_val_roc_aucs']
-        overall_val_pr_aucs = checkpoint['overall_val_pr_aucs']
-        class_val_roc_aucs = checkpoint['class_val_roc_aucs']
-        class_val_pr_aucs = checkpoint['class_val_pr_aucs']
+        # scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        # For pretrained networks, don't want first iteration to be loaded from pretraining
+        running_iter = 0
         # Ensure that no more loading is done for future folds
         LOAD = False
 
@@ -345,7 +394,7 @@ for fold in range(latest_fold, FOLDS):
         # Main model variables
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        # scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         # Get the validation entries from previous folds!
         val_preds = checkpoint['val_preds']
         val_labels = checkpoint['val_labels']
@@ -362,7 +411,8 @@ for fold in range(latest_fold, FOLDS):
             if isinstance(v, torch.Tensor):
                 state[k] = v.cuda()
 
-    # Pretrained loading workaround
+
+    # # Pretrained loading workaround
     if arguments.mode == 'pretrained':
         model.net._fc = nn.Linear(in_features=1536, out_features=4, bias=True)
         print(model.net._fc)
@@ -387,41 +437,9 @@ for fold in range(latest_fold, FOLDS):
     print(f'The length of the training is {len(train_df)}')
     print(f'The length of the validation is {len(val_df)}')
 
-    mean = [0.485, 0.456, 0.406]
-    std = [0.229, 0.224, 0.225]
-
-    # Pre-processing transforms
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean, std)
-    ])
-
-    val_transform = transforms.Compose([
-          transforms.Resize(input_size, 3),
-          transforms.ToTensor(),
-          transforms.Normalize(mean, std)
-    ])
-
-    tta_transform = transforms.Compose([transforms.Resize(input_size, 3),
-                                        transforms.Lambda(lambda image: torch.stack([
-                                            transforms.ToTensor()(image),
-                                            transforms.ToTensor()(image.rotate(90, resample=0)),
-                                            transforms.ToTensor()(image.rotate(180, resample=0)),
-                                            transforms.ToTensor()(image.rotate(270, resample=0)),
-                                            transforms.ToTensor()(image.transpose(method=Image.FLIP_TOP_BOTTOM)),
-                                            transforms.ToTensor()(
-                                                image.transpose(method=Image.FLIP_TOP_BOTTOM).rotate(90, resample=0)),
-                                            transforms.ToTensor()(
-                                                image.transpose(method=Image.FLIP_TOP_BOTTOM).rotate(180, resample=0)),
-                                            transforms.ToTensor()(
-                                                image.transpose(method=Image.FLIP_TOP_BOTTOM).rotate(270, resample=0)),
-                                        ])),
-                                        transforms.Lambda(lambda images: torch.stack(
-                                            [transforms.Normalize(mean, std)(image) for image in images]))
-                                        ])
-
     train_dataset = ImageDataset(train_df, transform, A_transform)
-    train_loader = DataLoader(train_dataset, batch_size=bs, num_workers=8, shuffle=True)
+    train_loader = DataLoader(train_dataset, batch_size=bs, sampler=ImbalancedDatasetSampler(train_dataset),
+                              num_workers=8)  #, shuffle=True)
 
     val_dataset = ImageDataset(val_df, tta_transform)
     val_loader = DataLoader(val_dataset, batch_size=int(bs/4), num_workers=8)
@@ -488,8 +506,8 @@ for fold in range(latest_fold, FOLDS):
 
             train_class_correct = [t*num_classes/total for t in train_class_correct]
             print("Epoch: {}, Loss: {},\n Train Accuracy: {}".format(epoch, running_loss, train_class_correct))
-            if epoch % 2 == 1:
-                scheduler.step()
+            # if epoch % 2 == 1:
+            #     scheduler.step()
 
             print('Validation step')
             model.eval()
@@ -676,7 +694,7 @@ for fold in range(latest_fold, FOLDS):
                 # elif epoch == (EPOCHS - 1):
                 torch.save({'model_state_dict': model.state_dict(),
                             'optimizer_state_dict': optimizer.state_dict(),
-                            'scheduler_state_dict': scheduler.state_dict(),
+                            # 'scheduler_state_dict': scheduler.state_dict(),
                             'epoch': epoch,
                             'loss': loss,
                             'running_iter': running_iter,
@@ -792,12 +810,14 @@ for classID, key in enumerate(precision_tot.keys()):
     plt.xlabel('Recall', fontsize=16)
     plt.ylabel('Precision', fontsize=16)
     plt.legend(loc="lower right")
-plt.savefig('precision-recall-' + encoder + '-bs%d-%d.png' % (bs, input_size[0]), dpi=300)
+fig_name = f'precision-recall-{encoder}-bs{bs}-{input_size[0]}.png'
+plt.savefig(os.path.join(SAVE_PATH, fig_name), dpi=300)
 
-
+# Save relevant data to csv
 val_labels = [x[0] for x in val_labels]
 val_preds = [x[0] for x in val_preds]
-sub = pd.DataFrame({"Filename":val_names, "Died":val_labels, "Pred":val_preds})
-sub.to_csv(os.path.join(SAVE_PATH, 'preds-' + encoder + '-bs%d-%d.csv' % (bs, input_size[0])), index=False)
+sub = pd.DataFrame({"Filename": val_names, "Died": val_labels, "Pred": val_preds})
+sub_name = f'preds-{encoder}-bs{bs}-{input_size[0]}.csv'
+sub.to_csv(os.path.join(SAVE_PATH, sub_name), index=False)
 
 print('END')
