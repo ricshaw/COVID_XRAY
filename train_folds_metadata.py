@@ -13,6 +13,7 @@ from sklearn.metrics import roc_auc_score, average_precision_score
 from sklearn.metrics import roc_curve, auc
 from sklearn.metrics import precision_recall_curve
 from sklearn.metrics import plot_precision_recall_curve
+from sklearn.preprocessing import StandardScaler
 
 import torch
 import torchvision
@@ -91,7 +92,13 @@ class ImageDataset(Dataset):
 
         image = self.transform(image)
         label = self.df.Died[index]
-        return image, filepath, label
+
+        #age = self.df.Age[index]
+        #gender = self.df.Gender[index]
+        #features = np.stack((age, gender)).astype(np.float32)
+        features = self.df.loc[index, '.cLac':'OBS BMI Calculation'].values.astype(np.float32)
+
+        return image, features, filepath, label
 
     def __len__(self):
         return self.df.shape[0]
@@ -116,19 +123,45 @@ class Model(nn.Module):
             'efficientnet-b8': (2.2, 3.6, 672, 0.5),
             'efficientnet-l2': (4.3, 5.3, 800, 0.5),
         }
-        #self.net = EfficientNet.from_pretrained(encoder)
-        #self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        #self.classifier = nn.Sequential(nn.Flatten(),
-        #                                nn.Dropout(0.8),
-        #                                nn.Linear(in_features=n_channels_dict[encoder], out_features=1, bias=True)
-        #                                )
-        self.net = EfficientNet.from_pretrained(encoder, num_classes=1)
+        n_feats = 44 #2
+        hidden1 = 128
+        hidden2 = 256
+        dropout = 0.3
+        self.fc1 = nn.Linear(n_feats, hidden1, bias=True)
+        self.fc2 = nn.Linear(hidden1, hidden2, bias=True)
+        self.meta = nn.Sequential(self.fc1,
+                                  #nn.BatchNorm1d(hidden1),
+                                  nn.ReLU(),
+                                  nn.Dropout(p=dropout),
+                                  self.fc2,
+                                  #nn.BatchNorm1d(hidden2),
+                                  nn.ReLU(),
+                                  nn.Dropout(p=dropout)
+                                 )
 
-    def forward(self, x):
-        #x = self.net.extract_features(x)
-        #x = self.avg_pool(x)
-        #out = self.classifier(x)
-        out = self.net(x)
+        self.net = EfficientNet.from_pretrained(encoder)
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.classifier = nn.Sequential(nn.Dropout(p=params_dict[encoder][-1]),
+                                        nn.Linear(in_features=n_channels_dict[encoder]+hidden2, out_features=1, bias=True)
+                                       )
+        #self.net = EfficientNet.from_pretrained(encoder, num_classes=1)
+
+    def forward(self, x, features):
+        #print('Network 0:', x.shape, features.shape)
+        x = self.net.extract_features(x)
+        x = self.avg_pool(x)
+        x = nn.Flatten()(x)
+
+        #features = F.relu(self.fc1(features))
+        #features = F.relu(self.fc2(features))
+        features = self.meta(features)
+        #print('Network 1:', x.shape, features.shape)
+
+        x = torch.cat([x, features], dim=1)
+        #print('Network 2:', x.shape, features.shape)
+
+        out = self.classifier(x)
+        #out = self.net(x)
         return out
 
 
@@ -155,22 +188,21 @@ class FocalLoss(nn.Module):
 
 
 ## Config
-#labels = '/nfs/home/richard/COVID_XRAY/cxr_news2_pseudonymised_filenames_jpgs_folds_filled.csv'
-labels = '/nfs/home/richard/COVID_XRAY/cxr_news2_pseudonymised_filenames_latest_folds.csv'
+labels = '/nfs/home/richard/COVID_XRAY/cxr_news2_pseudonymised_filenames_latest_filled_folds.csv'
 encoder = 'efficientnet-b3'
 EPOCHS = 100
 bs = 32
-input_size = (384,384)
+input_size = (352,352)
 FOLDS = 5
 alpha = 0.75
 gamma = 2.0
 OCCLUSION = False
 SAVE = True
-SAVE_NAME = encoder + '-bs%d-%d-tta-ranger-2' % (bs, input_size[0])
+SAVE_NAME = encoder + '-bs%d-%d-tta-ranger-meta' % (bs, input_size[0])
 SAVE_PATH = '/nfs/home/richard/COVID_XRAY/' + SAVE_NAME
+print(SAVE_NAME)
 log_name = './runs/' + SAVE_NAME
 writer = SummaryWriter(log_dir=log_name)
-print(SAVE_NAME)
 
 if SAVE:
     os.makedirs(SAVE_PATH, exist_ok=True)
@@ -183,6 +215,33 @@ print(df.head())
 print("Number of images:", df.shape[0])
 print("Died:", df[df.Died == 1].shape[0])
 print("Survived:", df[df.Died == 0].shape[0])
+
+## Remove missing data
+#df = df[df.Gender!='Missing']
+#df = df[df.Age!=-99]
+df = df.replace('Male', 1)
+df = df.replace('Female', 0)
+#df = df.replace('Chest - X ray', 1)
+#df = df.replace('Chest - Xray (Mobile)', 2)
+#df = df.replace('Nasogastric Tube Check - X Ray', 3)
+
+## Normalise meta data
+#df.Age -= df.Age.mean()
+#df.Age /= df.Age.std()
+df.Age /= df.Age.max()
+#metadata = np.stack((df.Age, df.Gender), axis=1)
+#scaler = StandardScaler()
+#scaler.fit(metadata)
+#metadata = scaler.transform(metadata)
+#df.Age = metadata[:,0]
+#df.Gender = metadata[:,1]
+
+bloods = df.loc[:,'.cLac':'OBS BMI Calculation'].values.astype(np.float32)
+print('Bloods', bloods.shape)
+scaler = StandardScaler()
+scaler.fit(bloods)
+bloods = scaler.transform(bloods)
+df.loc[:,'.cLac':'OBS BMI Calculation'] = bloods
 
 ## Transforms
 A_transform = A.Compose([
@@ -222,18 +281,15 @@ train_transform = transforms.Compose([
                               #transforms.RandomHorizontalFlip(),
                               #transforms.RandomVerticalFlip(),
                               #transforms.RandomRotation(90),
-                              transforms.Grayscale(num_output_channels=3),
                               transforms.ToTensor(),
                               transforms.Normalize(mean, std)
                             ])
 val_transform = transforms.Compose([
                               transforms.Resize(input_size, 3),
-                              transforms.Grayscale(num_output_channels=3),
                               transforms.ToTensor(),
                               transforms.Normalize(mean, std)
                             ])
 tta_transform = transforms.Compose([transforms.Resize(input_size, 3),
-                                    transforms.Grayscale(num_output_channels=3),
                                     transforms.Lambda(lambda image: torch.stack([
                                                                      transforms.ToTensor()(image),
                                                                      transforms.ToTensor()(image.rotate(90, resample=0)),
@@ -268,10 +324,10 @@ for fold in range(FOLDS):
     print('Valid', val_df.shape)
 
     train_dataset = ImageDataset(train_df, train_transform, A_transform)
-    train_loader = DataLoader(train_dataset, batch_size=bs, num_workers=8, shuffle=True)
+    train_loader = DataLoader(train_dataset, batch_size=bs, num_workers=4, shuffle=True, drop_last=True)
 
     val_dataset = ImageDataset(val_df, tta_transform)
-    val_loader = DataLoader(val_dataset, batch_size=int(bs/2), num_workers=8)
+    val_loader = DataLoader(val_dataset, batch_size=int(bs/2), num_workers=4)
 
     ## Init model
     model = Model(encoder)
@@ -301,12 +357,13 @@ for fold in range(FOLDS):
         res_prob = []
         res_label = []
         for i, sample in enumerate(train_loader):
-            images, names, labels = sample[0], sample[1], sample[2]
-            #print(images.shape, labels.shape)
+            images, features, names, labels = sample[0], sample[1], sample[2], sample[3]
+            #print('images', images.shape, 'features', features.shape, 'labels', labels.shape)
             images = images.cuda()
+            features = features.cuda()
             labels = labels.cuda()
             labels = labels.unsqueeze(1).float()
-            out = model(images)
+            out = model(images, features)
             #loss = criterion(out, labels)
             loss = sigmoid_focal_loss(out, labels, alpha=alpha, gamma=gamma, reduction="mean")
 
@@ -334,12 +391,13 @@ for fold in range(FOLDS):
         writer.add_scalar('Loss/train', loss.item(), epoch)
         writer.add_scalar('AUC/train', auc, epoch)
         writer.add_scalar('AP/train', ap, epoch)
+
         print("Epoch: {}, Loss: {}, Train Accuracy: {}".format(epoch, running_loss, round(correct/total, 4)))
         #if epoch % 2 == 1:
         #    scheduler.step()
 
         # Save model
-        if SAVE and epoch == (EPOCHS-1):
+        if SAVE:
             MODEL_PATH = os.path.join(SAVE_PATH, ('fold_%d_epoch_%d.pth' % (fold, epoch)))
             torch.save(model.state_dict(), MODEL_PATH)
 
@@ -354,16 +412,20 @@ for fold in range(FOLDS):
         res_label = []
         count = 0
         with torch.no_grad():
-            for images, names, labels in val_loader:
+            for images, features, names, labels in val_loader:
                 images = images.cuda()
+                features = features.cuda()
                 labels = labels.cuda()
                 labels = labels.unsqueeze(1).float()
-
+                print('images', images.shape, 'features', features.shape, 'labels', labels.shape)
 
                 ## TTA
                 batch_size, n_crops, c, h, w = images.size()
                 images = images.view(-1, c, h, w)
-                out = model(images)
+                _, n_feats = features.size()
+                features = features.repeat(1,n_crops).view(-1,n_feats)
+                print('tta images', images.shape, features.shape)
+                out = model(images, features)
                 out = out.view(batch_size, n_crops, -1).mean(1)
 
                 #loss = criterion(out.data, labels)
@@ -403,6 +465,7 @@ for fold in range(FOLDS):
         writer.add_scalar('Loss/val', loss.item(), epoch)
         writer.add_scalar('AUC/val', auc, epoch)
         writer.add_scalar('AP/val', ap, epoch)
+
         print("Epoch: {}, Loss: {}, Test Accuracy: {}, AUC: {}".format(epoch, running_loss, round(acc, 4), auc))
 
 
@@ -411,11 +474,6 @@ for fold in range(FOLDS):
             oc = Occlusion(model)
             x_shape = 16
             x_stride = 8
-            #random_index = np.random.randint(images.size(0))
-            #images = images[random_index, ...][None, ...].cuda()
-            #labels = labels[random_index, ...][None, ...].cuda()
-            #oc_images = images[(labels==1).squeeze()].cuda()
-            #oc_labels = labels[(labels==1).squeeze()].cuda()
             print('oc_images', oc_images.shape)
             print('oc_labels', oc_labels.shape)
             baseline = torch.zeros_like(oc_images).cuda()
@@ -457,8 +515,11 @@ auc = roc_auc_score(val_labels, val_preds)
 print("Total Accuracy: {}, AUC: {}".format(round(acc, 4), auc))
 print('AUC mean:', np.mean(val_auc), 'std:', np.std(val_auc))
 
+res_prob = [x[0] for x in res_prob]
+sub = pd.DataFrame({"Filename":val_names, "Died":val_labels.tolist(), "Pred":val_preds.tolist()})
+sub.to_csv(os.path.join(SAVE_PATH, 'preds.csv'), index=False)
 
-## ROC
+## Plot
 fpr, tpr, _ = roc_curve(val_labels, val_preds)
 plt.figure()
 lw = 2
@@ -473,7 +534,6 @@ plt.legend(loc="lower right")
 plt.savefig('roc-' + SAVE_NAME + '.png', dpi=300)
 
 
-## Precision-Recall
 average_precision = average_precision_score(val_labels, val_preds)
 precision, recall, thresholds = precision_recall_curve(val_labels, val_preds)
 plt.figure()
@@ -487,7 +547,6 @@ plt.legend(loc="lower right")
 plt.savefig('precision-recall-' + SAVE_NAME + '.png', dpi=300)
 
 
-## Predictions
 val_labels = [x[0] for x in val_labels]
 val_preds = [x[0] for x in val_preds]
 sub = pd.DataFrame({"Filename":val_names, "Died":val_labels, "Pred":val_preds})
