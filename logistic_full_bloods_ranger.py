@@ -275,13 +275,13 @@ if LOAD and num_files > 0:
     running_iter = checkpoint['running_iter']
     # Extras that may not exist in older models
     bs = checkpoint['batch_size']
-    EPOCHS = 400
+    EPOCHS = 170
     FOLDS = 5
 else:
     running_iter = 0
     loaded_epoch = -1
-    bs = 32
-    EPOCHS = 400
+    bs = 64
+    EPOCHS = 170
     FOLDS = 5
 
 # Load labels
@@ -427,6 +427,8 @@ for fold in range(latest_fold, FOLDS):
         # Get the validation entries from previous folds!
         val_preds = checkpoint['val_preds']
         val_labels = checkpoint['val_labels']
+        val_names = checkpoint['val_names']
+        mvp_features = checkpoint['mvp_features']
         overall_val_roc_aucs = checkpoint['overall_val_roc_aucs']
         overall_val_pr_aucs = checkpoint['overall_val_pr_aucs']
         # Ensure that no more loading is done for future folds
@@ -543,24 +545,24 @@ for fold in range(latest_fold, FOLDS):
             res_id = []
             res_prob = []
             res_label = []
-            if epoch == (EPOCHS - 1):
-                occlusion = False
-            else:
+            if (epoch == (EPOCHS - 1)) or (epoch % 10 == 0):
                 occlusion = True
+            else:
+                occlusion = False
             if occlusion:
                 occlusion_count = 0
                 for names, labels, bloods in val_loader:
                     # Pick one
-                    random_index = np.random.randint(labels.size(0))
-                    names = names[random_index]
-                    name = os.path.basename(names)
-                    name = os.path.splitext(name)[0]
-                    labels = labels[random_index, ...][None, ...].cuda()
+                    # random_index = np.random.randint(labels.size(0))
+                    # names = names[random_index]
+                    # name = os.path.basename(names)
+                    # name = os.path.splitext(name)[0]
+                    # labels = labels[random_index, ...][None, ...].cuda()
                     # print(label.shape, label)
                     # print(image.shape, image)
                     labels = labels.cuda()
                     labels = labels.unsqueeze(1).float()
-                    bloods = bloods[random_index, ...][None, ...]
+                    # bloods = bloods[random_index, ...][None, ...]
                     bloods = bloods.cuda().float()
 
                     # Account for tta: Take first image (non-augmented)
@@ -579,25 +581,29 @@ for fold in range(latest_fold, FOLDS):
                     print(baseline_bloods.shape)
                     # attributions = ig.attribute(image, baseline, target=target_ID, return_convergence_delta=False)
                     blud0 = oc.attribute(bloods, sliding_window_shapes=(1,),
-                                                    strides=(1,), target=0,
-                                                    baselines=baseline_bloods)
+                                         strides=(1,), target=0,
+                                         baselines=baseline_bloods)
                     # print('IG + SmoothGrad Attributions:', attributions)
                     # print('Convergence Delta:', delta)
 
                     # Print
-                    mvp_feature = temp_bloods.columns[int(np.argmax(blud0.cpu()))]
-                    print(f'The most valuable feature was {mvp_feature}')
+                    for single_feature in range(blud0.shape[0]):
+                        mvp_feature = temp_bloods.columns[int(np.argmax(blud0[single_feature, :].cpu()))]
+                        print(f'The most valuable feature was {mvp_feature}')
+                        if epoch == (EPOCHS - 1):
+                            mvp_features.append(mvp_feature)
 
+                    random_index = np.random.randint(labels.size(0))
+                    blud0 = blud0[random_index, :]
                     # Change bluds shape to rectangular for ease of visualisation
-                    occ_shape = factor_int(blud0.shape[1])
+                    occ_shape = factor_int(blud0.shape[0])
+                    print(f'occ shape is {occ_shape}')
                     blud0_grid = torchvision.utils.make_grid(torch.abs(torch.reshape(blud0, occ_shape)))
 
                     # Write to tensorboard
                     # Bluds
                     if occlusion_count == 0:
                         writer.add_image('Interpretability/Bloods', image_normaliser(blud0_grid), running_iter)
-                    if epoch == (EPOCHS - 1):
-                        mvp_features.append(mvp_feature)
                     occlusion_count += 1
 
             with torch.no_grad():
@@ -651,7 +657,7 @@ for fold in range(latest_fold, FOLDS):
                 overall_val_pr_aucs.append(true_pr_auc)
             print("Epoch: {}, Loss: {},\n Test Accuracy: {},\n ROC-AUCs: {},\n PR-AUCs {}\n".format(epoch,
                                                                                                     running_loss,
-                                                                                                    class_correct,
+                                                                                                    val_acc,
                                                                                                     true_auc,
                                                                                                     true_pr_auc))
             writer.add_scalar('Loss/AUC', true_auc, running_iter)
@@ -681,7 +687,9 @@ for fold in range(latest_fold, FOLDS):
                             'val_preds': val_preds,
                             'val_labels': val_labels,
                             'overall_val_roc_aucs': overall_val_roc_aucs,
-                            'overall_val_pr_aucs': overall_val_pr_aucs}, MODEL_PATH)
+                            'overall_val_pr_aucs': overall_val_pr_aucs,
+                            'mvp_features': mvp_features,
+                            'val_names': val_names}, MODEL_PATH)
 
     # Now that this fold's training has ended, want starting points of next fold to reset
     latest_epoch = -1
@@ -689,10 +697,10 @@ for fold in range(latest_fold, FOLDS):
     running_iter = 0
 
     # Print various fold outputs: Sanity check
-    print(f'Fold {fold} val_preds: {val_preds}')
-    print(f'Fold {fold} val_labels: {val_labels}')
-    print(f'Fold {fold} overall_val_roc_aucs: {overall_val_roc_aucs}')
-    print(f'Fold {fold} overall_val_pr_aucs: {overall_val_pr_aucs}')
+    # print(f'Fold {fold} val_preds: {val_preds}')
+    # print(f'Fold {fold} val_labels: {val_labels}')
+    # print(f'Fold {fold} overall_val_roc_aucs: {overall_val_roc_aucs}')
+    # print(f'Fold {fold} overall_val_pr_aucs: {overall_val_pr_aucs}')
 
 
 ## Totals
@@ -711,10 +719,12 @@ acc = correct / len(val_labels)
 folds_roc_auc = roc_auc_score(val_labels, val_preds)
 precision_folds, recall_folds, _ = precision_recall_curve(val_labels.ravel(), val_preds.ravel())
 folds_pr_auc = auc(recall_folds, precision_folds)
-print("Total Accuracy: {}, AUC: {}".format(round(acc, 4), folds_roc_auc))
+# print("Total Accuracy: {}, AUC: {}".format(round(acc, 4), folds_roc_auc))
 print('ROC AUC mean:', np.mean(overall_val_roc_aucs), 'std:', np.std(overall_val_roc_aucs))
 print('PR AUC mean:', np.mean(overall_val_pr_aucs), 'std:', np.std(overall_val_pr_aucs))
 
+print(f'Length of val_names, val_labels, val_preds, mvp_features are {len(val_names)},'
+      f'{len(val_labels.tolist())}, {len(val_preds.tolist())}, {len(mvp_features)}')
 sub = pd.DataFrame({"Filename": val_names, "Died": val_labels.tolist(), "Pred": val_preds.tolist(), "MVP_feat": mvp_features})
 sub.to_csv(os.path.join(SAVE_PATH, 'preds.csv'), index=False)
 
