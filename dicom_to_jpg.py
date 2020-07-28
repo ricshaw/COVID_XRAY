@@ -8,7 +8,6 @@ from datetime import datetime as dt
 
 print(pd.__version__)
 
-#labels = pd.read_csv('KCH_CXR_labels.csv')
 labels = pd.read_csv('cxr_news2_pseudonymised.csv')
 #labels = labels.sort_values('AccessionID')
 print('Labels', labels.shape)
@@ -22,6 +21,8 @@ save_path = '/nfs/project/covid/CXR/KCH_CXR_JPG'
 
 csv = [f for f in Path(PATH).rglob('*.dcm')]
 print('Dicoms', len(csv))
+
+Filename = []
 Accession = []
 CXR_datetime = []
 Pixel_data = []
@@ -43,8 +44,14 @@ for f in csv:
         datetime = ds.AcquisitionDateTime.split('.')[0]
     elif "ContributionDateTime" in ds:
         datetime = ds.ContributionDateTime.split('.')[0]
+    elif ("StudyDate" in ds) and ("StudyTime" in ds):
+        datetime = ds.StudyDate + ds.StudyTime
+    else:
+        print('No date time for', f)
+        exit(0)
     name = acc
     fname = str(name) + '_' + str(datetime)
+    Filename.append(fname)
     datetime = pd.to_datetime(datetime, format='%Y%m%d%H%M%S')
     CXR_datetime.append(datetime)
     try:
@@ -66,9 +73,9 @@ for f in csv:
 print('Accession', acc_count)
 print('Pixel data', pix_count)
 print('Combined', combined_count)
-#df = pd.DataFrame({'Accession':Accession, 'CXR_datetime':CXR_datetime, 'Pixel_data':Pixel_data})
-#print(df)
-#df.to_csv('all_data.csv', index=False)
+df = pd.DataFrame({'Filename':Filename, 'Accession':Accession, 'CXR_datetime':CXR_datetime, 'Pixel_data':Pixel_data})
+print(df)
+df.to_csv('all_data.csv', index=False)
 exit(0)
 
 files = 0

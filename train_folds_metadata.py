@@ -27,6 +27,7 @@ import torch.nn.functional as F
 import albumentations as A
 from efficientnet_pytorch import EfficientNet
 from focal_loss import sigmoid_focal_loss, sigmoid_focal_loss_star
+from cutout import Cutout
 
 import sys
 sys.path.append('/nfs/home/richard/over9000')
@@ -73,6 +74,23 @@ def image_normaliser(some_image):
     return 1 * (some_image - torch.min(some_image)) / (torch.max(some_image) - torch.min(some_image))
 
 
+def rand_bbox(size, lam):
+    W = size[2]
+    H = size[3]
+    cut_rat = np.sqrt(1. - lam)
+    cut_w = np.int(W * cut_rat)
+    cut_h = np.int(H * cut_rat)
+
+    cx = np.random.randint(W)
+    cy = np.random.randint(H)
+
+    bbx1 = np.clip(cx - cut_w // 2, 0, W)
+    bby1 = np.clip(cy - cut_h // 2, 0, H)
+    bbx2 = np.clip(cx + cut_w // 2, 0, W)
+    bby2 = np.clip(cy + cut_h // 2, 0, H)
+    return bbx1, bby1, bbx2, bby2
+
+
 class ImageDataset(Dataset):
     def __init__(self, df, transform, A_transform=None):
         self.df = df
@@ -96,7 +114,13 @@ class ImageDataset(Dataset):
         #age = self.df.Age[index]
         #gender = self.df.Gender[index]
         #features = np.stack((age, gender)).astype(np.float32)
-        features = self.df.loc[index, '.cLac':'OBS BMI Calculation'].values.astype(np.float32)
+        first_blood = '.cLac'
+        last_blood = 'OBS BMI Calculation'
+        bloods = self.df.loc[index, first_blood:last_blood].values.astype(np.float32)
+        first_vital = 'Fever (finding)'
+        last_vital = 'Immunodeficiency disorder (disorder)'
+        vitals = self.df.loc[index, first_vital:last_vital].values.astype(np.float32)
+        features = np.concatenate((bloods, vitals), axis=0)
 
         return image, features, filepath, label
 
@@ -123,7 +147,7 @@ class Model(nn.Module):
             'efficientnet-b8': (2.2, 3.6, 672, 0.5),
             'efficientnet-l2': (4.3, 5.3, 800, 0.5),
         }
-        n_feats = 44 #2
+        n_feats = 44 + 32
         hidden1 = 128
         hidden2 = 256
         dropout = 0.3
@@ -188,17 +212,19 @@ class FocalLoss(nn.Module):
 
 
 ## Config
-labels = '/nfs/home/richard/COVID_XRAY/cxr_news2_pseudonymised_filenames_latest_filled_folds.csv'
+labels = '/nfs/home/richard/COVID_XRAY/cxr_news2_pseudonymised_filenames_latest_folds_zeros.csv'
 encoder = 'efficientnet-b3'
 EPOCHS = 100
-bs = 32
-input_size = (352,352)
+bs = 16
+input_size = (512,512)
 FOLDS = 5
 alpha = 0.75
 gamma = 2.0
+CUTOUT = False
+CUTMIX_PROB = 1.0
 OCCLUSION = False
 SAVE = True
-SAVE_NAME = encoder + '-bs%d-%d-tta-ranger-meta' % (bs, input_size[0])
+SAVE_NAME = encoder + '-bs%d-%d-tta-ranger-meta-vitals-cutmix-zeros' % (bs, input_size[0])
 SAVE_PATH = '/nfs/home/richard/COVID_XRAY/' + SAVE_NAME
 print(SAVE_NAME)
 log_name = './runs/' + SAVE_NAME
@@ -236,12 +262,20 @@ df.Age /= df.Age.max()
 #df.Age = metadata[:,0]
 #df.Gender = metadata[:,1]
 
-bloods = df.loc[:,'.cLac':'OBS BMI Calculation'].values.astype(np.float32)
+first_blood = '.cLac'
+last_blood = 'OBS BMI Calculation'
+bloods = df.loc[:,first_blood:last_blood].values.astype(np.float32)
 print('Bloods', bloods.shape)
+first_vital = 'Fever (finding)'
+last_vital = 'Immunodeficiency disorder (disorder)'
+vitals = df.loc[:,first_vital:last_vital].values.astype(np.float32)
+print('Vitals', vitals.shape)
 scaler = StandardScaler()
-scaler.fit(bloods)
-bloods = scaler.transform(bloods)
-df.loc[:,'.cLac':'OBS BMI Calculation'] = bloods
+X = np.concatenate((bloods, vitals), axis=1)
+scaler.fit(X)
+X = scaler.transform(X)
+df.loc[:,first_blood:last_blood] = X[:,0:bloods.shape[1]]
+df.loc[:,first_vital:last_vital] = X[:,bloods.shape[1]::]
 
 ## Transforms
 A_transform = A.Compose([
@@ -284,6 +318,8 @@ train_transform = transforms.Compose([
                               transforms.ToTensor(),
                               transforms.Normalize(mean, std)
                             ])
+if CUTOUT:
+    train_transform.transforms.append(Cutout(n_holes=1, length=160))
 val_transform = transforms.Compose([
                               transforms.Resize(input_size, 3),
                               transforms.ToTensor(),
@@ -363,12 +399,46 @@ for fold in range(FOLDS):
             features = features.cuda()
             labels = labels.cuda()
             labels = labels.unsqueeze(1).float()
-            out = model(images, features)
-            #loss = criterion(out, labels)
-            loss = sigmoid_focal_loss(out, labels, alpha=alpha, gamma=gamma, reduction="mean")
+
+            ## CUTMIX
+            prob = np.random.rand(1)
+            if prob < CUTMIX_PROB:
+                # generate mixed sample
+                lam = np.random.beta(1,1)
+                rand_index = torch.randperm(images.size()[0]).cuda()
+                target_a = labels
+                target_b = labels[rand_index]
+                features_a = features
+                features_b = features[rand_index]
+                bbx1, bby1, bbx2, bby2 = rand_bbox(images.size(), lam)
+                images[:, :, bbx1:bbx2, bby1:bby2] = images[rand_index, :, bbx1:bbx2, bby1:bby2]
+                # adjust lambda to exactly match pixel ratio
+                lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (images.size()[-1] * images.size()[-2]))
+                features = features_a * lam + features_b * (1. - lam)
+                # compute output
+                out = model(images, features)
+                #loss = criterion(out, target_a) * lam + criterion(out, target_b) * (1. - lam)
+                loss = sigmoid_focal_loss(out, target_a, alpha, gamma, reduction="mean") * lam + \
+                       sigmoid_focal_loss(out, target_b, alpha, gamma, reduction="mean") * (1. - lam)
+
+            else:
+                out = model(images, features)
+                #loss = criterion(out, labels)
+                loss = sigmoid_focal_loss(out, labels, alpha=alpha, gamma=gamma, reduction="mean")
 
             optimizer.zero_grad()
             loss.backward()
+
+            # GradAug
+            #a = 0.9
+            #for name, param in model.named_parameters():
+            #    if param.requires_grad:
+            #        print(name, param.shape) #param.data
+            #        if param.grad is not None:
+            #            print(param.size())
+            #            if len(param.shape) == 4:
+            #                param.grad[-10::, -10::, :, :] = 0
+
             optimizer.step()
             running_loss += loss.item()
 

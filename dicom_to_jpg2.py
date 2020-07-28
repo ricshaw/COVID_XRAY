@@ -8,26 +8,23 @@ from datetime import datetime as dt
 
 print(pd.__version__)
 
-jpgs = pd.read_csv('KCH_CXR_JPG.csv')
-print(jpgs.shape)
-
-acc = []
-for a in jpgs.Accession:
-    acc.append(a)
-print(len(acc))
+jpgs = pd.read_csv('all_jpgs_sorted.csv')
+print('jpgs', jpgs.shape)
 
 labels = pd.read_csv('cxr_news2_pseudonymised.csv')
 #labels = labels.sort_values('AccessionID')
 print('Labels', labels.shape)
 
+SAVE_PATH = '/nfs/project/covid/CXR/KCH_CXR_JPG'
+Filename = []
+for a in labels.Accession:
+    f = jpgs[jpgs.Accession==a].Filename.values[0]
+    Filename.append(os.path.join(SAVE_PATH, f + '.jpg'))
 
-
-for a in jpgs.Accession:
-    print(labels[labels.Accession==a])
-
-
-
-
+#print(Filename)
+labels['Filename'] = Filename
+print(labels.head())
+labels.to_csv('cxr_news2_pseudonymised_filenames.csv', index=False)
 exit(0)
 
 #labels = labels.drop_duplicates(subset=['AccessionID'], ignore_index=True)
