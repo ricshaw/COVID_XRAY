@@ -5,8 +5,21 @@ import os
 import cv2
 from pathlib import Path
 from datetime import datetime as dt
-
 print(pd.__version__)
+
+
+def win_scale(data, wl, ww, dtype, out_range):
+    """
+    Scale pixel intensity data using specified window level, width, and intensity range.
+    """
+    data_new = np.empty(data.shape, dtype=np.double)
+    data_new.fill(out_range[1]-1)
+    data_new[data <= (wl-ww/2.0)] = out_range[0]
+    data_new[(data>(wl-ww/2.0))&(data<=(wl+ww/2.0))] = \
+         ((data[(data>(wl-ww/2.0))&(data<=(wl+ww/2.0))]-(wl-0.5))/(ww-1.0)+0.5)*(out_range[1]-out_range[0])+out_range[0]
+    data_new[data > (wl+ww/2.0)] = out_range[1]-1
+    return data_new.astype(dtype)
+
 
 labels = pd.read_csv('cxr_news2_pseudonymised.csv')
 #labels = labels.sort_values('AccessionID')
@@ -17,7 +30,7 @@ print('Labels', labels.shape)
 #exit(0)
 
 PATH = '/nfs/project/covid/CXR/KCH_CXR'
-save_path = '/nfs/project/covid/CXR/KCH_CXR_JPG'
+save_path = '/nfs/project/covid/CXR/KCH_CXR_JPG_CONTRAST_FIX'
 
 csv = [f for f in Path(PATH).rglob('*.dcm')]
 print('Dicoms', len(csv))
@@ -55,7 +68,14 @@ for f in csv:
     datetime = pd.to_datetime(datetime, format='%Y%m%d%H%M%S')
     CXR_datetime.append(datetime)
     try:
-        img = ds.pixel_array.astype(np.float32)
+        wl, ww = ds.WindowCenter, ds.WindowWidth
+        if isinstance(wl, pydicom.multival.MultiValue):
+            img = win_scale(data=ds.pixel_array, wl= int(wl[0]), ww=int(ww[0]), dtype = np.uint16, out_range=[0, 16383])
+        else:
+            img = win_scale(data=ds.pixel_array, wl= int(wl), ww=int(ww), dtype = np.uint16, out_range=[0, 16383])
+
+        #img = ds.pixel_array.astype(np.float32)
+        img = img.astype(np.float32)
         img -= img.min()
         img /= img.max()
         img = np.uint8(255.0*img)
@@ -75,7 +95,7 @@ print('Pixel data', pix_count)
 print('Combined', combined_count)
 df = pd.DataFrame({'Filename':Filename, 'Accession':Accession, 'CXR_datetime':CXR_datetime, 'Pixel_data':Pixel_data})
 print(df)
-df.to_csv('all_data.csv', index=False)
+#df.to_csv('all_data.csv', index=False)
 exit(0)
 
 files = 0
