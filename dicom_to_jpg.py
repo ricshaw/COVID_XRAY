@@ -30,7 +30,8 @@ print('Labels', labels.shape)
 #exit(0)
 
 PATH = '/nfs/project/covid/CXR/KCH_CXR'
-save_path = '/nfs/project/covid/CXR/KCH_CXR_JPG_CONTRAST_FIX'
+save_path = '/nfs/project/covid/CXR/tmp'
+#save_path = '/nfs/project/covid/CXR/KCH_CXR_JPG_CONTRAST_FIX'
 
 csv = [f for f in Path(PATH).rglob('*.dcm')]
 print('Dicoms', len(csv))
