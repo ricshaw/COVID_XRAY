@@ -64,20 +64,20 @@ seed_everything(42)
 
 ## Config
 data = '/nfs/home/richard/COVID_XRAY/cxr_news2_pseudonymised_filenames_folds.csv'
-#test_data = '/nfs/home/richard/COVID_XRAY/gstt.csv'
-test_data = '/nfs/home/richard/COVID_XRAY/gstt_new.csv'
+test_data = '/nfs/home/richard/COVID_XRAY/gstt.csv'
+#test_data = '/nfs/home/richard/COVID_XRAY/gstt_new.csv'
 encoder = 'efficientnet-b0'
-IMAGES = False
+IMAGES = True
 FEATS = True
 MULTI = True
-EPOCHS = 50
-MIN_EPOCHS = 50
+EPOCHS = 30
+MIN_EPOCHS = 30
 PATIENCE = 5
 bs = 64
 input_size = (256,256)
 FOLDS = 5
-#alpha = 0.75
 gamma = 2.0
+CENTRE_CROP = False
 CUTMIX_PROB = 0.0
 OCCLUSION = False
 SAVE = True
@@ -117,12 +117,6 @@ def new_section(text):
 
 def prepare_data(df, bloods_cols):
     print('Preparing data')
-    # Define columns
-    #first_blood = '.cLac'
-    #last_blood = 'BMI'
-    #first_vital = 'Fever (finding)'
-    #last_vital = 'Immunodeficiency disorder (disorder)'
-
     ## Replace data
     df.Age.replace(120, np.nan, inplace=True)
     df.Ethnicity.replace('Unknown', np.nan, inplace=True)
@@ -139,14 +133,10 @@ def prepare_data(df, bloods_cols):
     df['min_datetime'] = df['CXR_datetime']
     df['min_datetime'] = df.groupby('patient_pseudo_id')['min_datetime'].transform('min')
     df['rel_datetime'] = (df['CXR_datetime'] - df['min_datetime']) / np.timedelta64(1,'D')
-    #print(df.head(10))
 
     # Extract features
-    #bloods = df.loc[:,first_blood:last_blood].values.astype(np.float32)
     bloods = df.loc[:,bloods_cols].values.astype(np.float32)
     print('Bloods', bloods.shape)
-    #vitals = df.loc[:,first_vital:last_vital].values.astype(np.float32)
-    #print('Vitals', vitals.shape)
     age = df.Age[:,None]
     gender = df.Gender[:,None]
     ethnicity = df.Ethnicity[:,None]
@@ -157,8 +147,6 @@ def prepare_data(df, bloods_cols):
     X = np.concatenate((bloods, age, gender, ethnicity, time), axis=1)
     scaler.fit(X)
     X = scaler.transform(X)
-    #X = np.concatenate((X, vitals), axis=1)
-    #print(X.shape)
 
     # Fill missing
     #print('Features before', np.nanmin(X), np.nanmax(X))
@@ -170,13 +158,11 @@ def prepare_data(df, bloods_cols):
     #print('Missing after: %d' % sum(np.isnan(X).flatten()))
 
     # Put back features
-    #df.loc[:,first_blood:last_blood] = X[:,0:bloods.shape[1]]
     df.loc[:,bloods_cols] = X[:,0:bloods.shape[1]]
     df.loc[:,'Age'] = X[:,bloods.shape[1]]
     df.loc[:,'Gender'] = X[:,bloods.shape[1]+1]
     df.loc[:,'Ethnicity'] = X[:,bloods.shape[1]+2]
     df.loc[:,'rel_datetime'] = X[:,bloods.shape[1]+3]
-    #df.loc[:,first_vital:last_vital] = X[:,bloods.shape[1]+3::]
     return df
 
 def default_image_loader(path):
@@ -213,17 +199,51 @@ def get_feats(df, i, aug=False):
     age = df.Age[i].astype(np.float32)
     gender = df.Gender[i].astype(np.float32)
     ethnicity = df.Ethnicity[i].astype(np.float32)
-    #first_blood = '.cLac'
-    #last_blood = 'BMI'
     bloods = df.loc[i, bloods_cols].values.astype(np.float32)
     if aug:
         bloods += np.random.normal(0, 0.2, bloods.shape)
-    #first_vital = 'Fever (finding)'
-    #last_vital = 'Immunodeficiency disorder (disorder)'
-    #vitals = df.loc[i, first_vital:last_vital].values.astype(np.float32)
-    #feats = np.concatenate((bloods, [age, gender, ethnicity], vitals), axis=0)
     feats = np.concatenate((bloods, [age, gender, ethnicity]), axis=0)
     return feats
+
+def get_image(df, i, transform, A_transform=None):
+    image = default_image_loader(df.Filename[i])
+    # Centre crop
+    if CENTRE_CROP:
+        image = transforms.CenterCrop(min(image.size))(image)
+    # A transform
+    if A_transform is not None:
+        image = np.array(image)
+        image = A_transform(image=image)['image']
+        image = Image.fromarray(image)
+    # Transform
+    image = transform(image)
+    return image
+
+class SingleImageDataset(Dataset):
+    def __init__(self, my_df, transform, A_transform=None):
+        self.df = my_df
+        self.loader = default_image_loader
+        self.transform = transform
+        self.A_transform = A_transform
+
+    def __getitem__(self, index):
+        image, feats = np.array([]), np.array([])
+        pid = self.df.patient_pseudo_id[index]
+        # Image
+        if IMAGES:
+            image = get_image(self.df, index, self.transform, self.A_transform)
+        # Features
+        if FEATS:
+            feats = get_feats(self.df, index, aug=True)
+            time = self.df.rel_datetime[index].astype(np.float32)
+            feats = np.append(feats, time)
+        # Label
+        label = self.df.Died[index]
+        return pid, image, feats, label
+
+    def __len__(self):
+        return self.df.shape[0]
+
 
 class ImageDataset(Dataset):
     def __init__(self, my_df, transform, A_transform=None):
@@ -236,7 +256,6 @@ class ImageDataset(Dataset):
     def __getitem__(self, index):
         image1, image2 = np.array([]), np.array([])
         feats1, feats2 = np.array([]), np.array([])
-
         # Select unique patient
         pid = self.unique_df.patient_pseudo_id[index]
         # Get all patient data
@@ -257,25 +276,10 @@ class ImageDataset(Dataset):
             feats2 = np.append(feats2, time2)
         # Image
         if IMAGES:
-            image1 = self.loader(pid_df.Filename[0])
-            image2 = self.loader(pid_df.Filename[1])
-            # Centre crop
-            image1 = transforms.CenterCrop(min(image1.size))(image1)
-            image2 = transforms.CenterCrop(min(image2.size))(image2)
-            # A transform
-            if self.A_transform is not None:
-                image1 = np.array(image1)
-                image2 = np.array(image2)
-                image1 = self.A_transform(image=image1)['image']
-                image2 = self.A_transform(image=image2)['image']
-                image1 = Image.fromarray(image1)
-                image2 = Image.fromarray(image2)
-            # Transform
-            image1 = self.transform(image1)
-            image2 = self.transform(image2)
+            image1 = get_image(pid_df, 0, self.transform, self.A_transform)
+            image2 = get_image(pid_df, 1, self.transform, self.A_transform)
         # Label
         label = pid_df.Died[0]
-
         return pid, image1, image2, feats1, feats2, time1, time2, label
 
     def __len__(self):
@@ -432,22 +436,7 @@ val_transform = transforms.Compose([
                               transforms.ToTensor(),
                               transforms.Normalize(mean, std)
                             ])
-if False:
-    tta_transform = transforms.Compose([transforms.Resize(input_size, 3),
-                                    transforms.Lambda(lambda image: torch.stack([
-                                                                     transforms.ToTensor()(image),
-                                                                     transforms.ToTensor()(image.rotate(90, resample=0)),
-                                                                     transforms.ToTensor()(image.rotate(180, resample=0)),
-                                                                     transforms.ToTensor()(image.rotate(270, resample=0)),
-                                                                     transforms.ToTensor()(image.transpose(method=Image.FLIP_TOP_BOTTOM)),
-                                                                     transforms.ToTensor()(image.transpose(method=Image.FLIP_TOP_BOTTOM).rotate(90, resample=0)),
-                                                                     transforms.ToTensor()(image.transpose(method=Image.FLIP_TOP_BOTTOM).rotate(180, resample=0)),
-                                                                     transforms.ToTensor()(image.transpose(method=Image.FLIP_TOP_BOTTOM).rotate(270, resample=0)),
-                                                                     ])),
-                                         transforms.Lambda(lambda images: torch.stack([transforms.Normalize(mean, std)(image) for image in images]))
-                                       ])
-else:
-    tta_transform = transforms.Compose([transforms.Resize(input_size, 3),
+tta_transform = transforms.Compose([transforms.Resize(input_size, 3),
                                         transforms.Lambda(lambda image: torch.stack([
                                                                      transforms.ToTensor()(image),
                                                                      transforms.ToTensor()(image.rotate(90, resample=0)),
@@ -504,6 +493,7 @@ if False:
 val_preds = []
 val_labels = []
 val_names = []
+val_acc = []
 val_auc = []
 
 ## Fold loop
@@ -522,12 +512,15 @@ for fold in range(FOLDS):
     print('Valid', val_df.shape)
 
     ## Train dataset
-    train_dataset = ImageDataset(train_df, train_transform, A_transform)
+    if MULTI:
+        train_dataset = ImageDataset(train_df, train_transform, A_transform)
+    else:
+        train_dataset = SingleImageDataset(train_df, train_transform, A_transform)
     train_loader = DataLoader(train_dataset, batch_size=bs, num_workers=4, shuffle=True, drop_last=True)
 
     ## Val dataser
-    val_dataset = ImageDataset(val_df, tta_transform)
-    val_loader = DataLoader(val_dataset, batch_size=4, num_workers=4)
+    #val_dataset = ImageDataset(val_df, tta_transform)
+    #val_loader = DataLoader(val_dataset, batch_size=4, num_workers=4)
 
     ## Init model
     singlemodel = SingleModel(encoder).cuda()
@@ -538,6 +531,7 @@ for fold in range(FOLDS):
     alpha = train_df[train_df.Died==0].shape[0]/train_df.shape[0]
     print('Alpha', alpha)
 
+    running_acc = []
     running_auc = []
     running_preds = []
     best_auc = 0.0
@@ -546,7 +540,7 @@ for fold in range(FOLDS):
     ## Training loop
     for epoch in range(EPOCHS):
 
-        # Training
+        # Training step
         print('\nTraining step')
         model.cuda()
         model.train()
@@ -559,10 +553,17 @@ for fold in range(FOLDS):
         for i, sample in enumerate(train_loader):
 
             pid = sample[0]
-            image1, image2 = sample[1].cuda(), sample[2].cuda()
-            feats1, feats2 = sample[3].cuda(), sample[4].cuda()
-            time1, time2 = sample[5], sample[6]
-            labels = sample[7].cuda()
+            if MULTI:
+                image1, image2 = sample[1].cuda(), sample[2].cuda()
+                feats1, feats2 = sample[3].cuda(), sample[4].cuda()
+                time1, time2 = sample[5], sample[6]
+                labels = sample[7].cuda()
+            else:
+                image1 = sample[1].cuda()
+                feats1 = sample[2].cuda()
+                labels = sample[3].cuda()
+                image2 = None
+                feats2 = None
             labels = labels.unsqueeze(1).float()
             #print('image1', image1, 'feats1', feats1, 'image2', image2, 'feats2', feats2)
 
@@ -571,15 +572,15 @@ for fold in range(FOLDS):
             if prob < CUTMIX_PROB:
                 # generate mixed sample
                 lam = np.random.beta(1,1)
-                rand_index = torch.randperm(images.size()[0]).cuda()
+                rand_index = torch.randperm(image1.size()[0]).cuda()
                 target_a = labels
                 target_b = labels[rand_index]
                 features_a = features
                 features_b = features[rand_index]
-                bbx1, bby1, bbx2, bby2 = rand_bbox(images.size(), lam)
-                images[:, :, bbx1:bbx2, bby1:bby2] = images[rand_index, :, bbx1:bbx2, bby1:bby2]
+                bbx1, bby1, bbx2, bby2 = rand_bbox(image1.size(), lam)
+                image1[:, :, bbx1:bbx2, bby1:bby2] = image1[rand_index, :, bbx1:bbx2, bby1:bby2]
                 # adjust lambda to exactly match pixel ratio
-                lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (images.size()[-1] * images.size()[-2]))
+                lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (image1.size()[-1] * image1.size()[-2]))
                 features = features_a * lam + features_b * (1. - lam)
                 # compute output
                 out = model(image1, feats1, image2, feats2)
@@ -624,7 +625,7 @@ for fold in range(FOLDS):
             MODEL_PATH = os.path.join(SAVE_PATH, ('fold_%d_epoch_%d.pth' % (fold, epoch)))
             torch.save(model.state_dict(), MODEL_PATH)
 
-        ## Validation
+        ## Validation step
         print('\nValidation step')
         model.eval()
         running_loss = 0
@@ -658,14 +659,8 @@ for fold in range(FOLDS):
                     feats1, feats2 = np.array([]), np.array([])
                 if IMAGES:
                     # Image
-                    image1 = default_image_loader(pid_df.Filename[ind1])
-                    image2 = default_image_loader(pid_df.Filename[ind2])
-                    # Centre crop
-                    image1 = transforms.CenterCrop(min(image1.size))(image1)
-                    image2 = transforms.CenterCrop(min(image2.size))(image2)
-                    # Transform
-                    image1 = tta_transform(image1)
-                    image2 = tta_transform(image2)
+                    image1 = get_image(pid_df, ind1, tta_transform)
+                    image2 = get_image(pid_df, ind2, tta_transform)
                 else:
                     image1, image2 = torch.FloatTensor(), torch.FloatTensor()
                 # Label
@@ -718,11 +713,12 @@ for fold in range(FOLDS):
         auc = roc_auc_score(y_true, y_scores)
         ap = average_precision_score(y_true, y_scores)
         running_auc.append(auc)
+        running_acc.append(acc)
         running_preds.append(y_scores)
         id = int(np.argmax(running_auc))
         print("Epoch: {}, Loss: {}, Test Accuracy: {}, AUC: {}".format(epoch, running_loss, round(acc, 4), auc))
         print('All AUC:', running_auc)
-        print('Best AUC:', id, running_auc[id])
+        print('Best Result -- Epoch:', id, 'AUC:', running_auc[id], 'Accuracy:', running_acc[id])
 
         # Tensorboard
         writer.add_scalar('Loss/val', loss.item(), epoch)
@@ -744,6 +740,7 @@ for fold in range(FOLDS):
         if ((epoch>=MIN_EPOCHS) and (stop_count>PATIENCE)) or (epoch==(EPOCHS-1)):
             print('Stopping!')
             val_preds += running_preds[id].tolist()
+            val_acc += [running_acc[id]]
             val_auc += [running_auc[id]]
             val_labels += res_label
             val_names += res_name
@@ -791,11 +788,13 @@ for fold in range(FOLDS):
 val_labels = np.array(val_labels)
 val_preds = np.array(val_preds)
 val_auc = np.array(val_auc)
+val_acc = np.array(val_acc)
 print('Labels:', len(val_labels), 'Preds:', len(val_preds), 'Names:', len(val_names), 'AUCs:', len(val_auc))
 correct = ((val_preds > 0.5).astype(int) == val_labels).sum()
 acc = correct / len(val_labels)
 auc = roc_auc_score(val_labels, val_preds)
 print("Total Accuracy: {}, AUC: {}".format(round(acc, 4), auc))
+print('Accuracy mean:', np.mean(val_acc), 'std:', np.std(val_acc))
 print('AUC mean:', np.mean(val_auc), 'std:', np.std(val_auc))
 
 ## ROC curve
@@ -878,14 +877,8 @@ for fold in range(FOLDS):
                 feats1, feats2 = np.array([]), np.array([])
             if IMAGES:
                 # Image
-                image1 = default_image_loader(pid_df.Filename[ind1])
-                image2 = default_image_loader(pid_df.Filename[ind2])
-                # Centre crop
-                image1 = transforms.CenterCrop(min(image1.size))(image1)
-                image2 = transforms.CenterCrop(min(image2.size))(image2)
-                # Transform
-                image1 = tta_transform(image1)
-                image2 = tta_transform(image2)
+                image1 = get_image(pid_df, ind1, tta_transform)
+                image2 = get_image(pid_df, ind2, tta_transform)
             else:
                 image1, image2 = torch.FloatTensor(), torch.FloatTensor()
             # Label
