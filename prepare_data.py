@@ -7,14 +7,14 @@ from pandas.api.types import is_numeric_dtype
 from pandas.api.types import is_datetime64_any_dtype as is_datetime
 
 ## Load labs
-#df_labs = pd.read_csv('/data/COVID/GSTT/labs_edit.csv')
-df_labs = pd.read_csv('labs_edit.csv')
+df_labs = pd.read_csv('/data/COVID/GSTT/labs_edit.csv')
+#df_labs = pd.read_csv('labs_edit.csv')
 df_labs['CreatedWhen'] = pd.to_datetime(df_labs.CreatedWhen).dt.floor('1D')
 #print(df_labs.head(200))
 
 ## Load data
-#df = pd.read_csv('/data/COVID/GSTT/data.csv')
-df = pd.read_csv('data.csv')
+df = pd.read_csv('/data/COVID/GSTT/data.csv')
+#df = pd.read_csv('data.csv')
 df = df.loc[:, ~df.columns.str.contains('^Unnamed')]
 df = df.rename(columns={'PatientShortId': 'patient_pseudo_id'})
 
@@ -183,6 +183,7 @@ df1 = df[['patient_pseudo_id',
 ]]
 print(df1.head(50))
 
+## Merge with labs
 df1 = df1.reset_index(drop=True)
 df_labs = df_labs.reset_index(drop=True)
 df2 = pd.merge_asof(df1.sort_values('CreatedWhen'), df_labs.sort_values('CreatedWhen'), on='CreatedWhen', by='patient_pseudo_id')
@@ -190,6 +191,8 @@ df2 = df2.drop(columns='ESR')
 df2.reset_index(drop=True)
 df2 = df2.sort_values('patient_pseudo_id').reset_index(drop=True)
 df2 = df2.rename(columns={'CreatedWhen': 'CXR_datetime'})
+df2['Oxygen Saturation'] = df2.loc[:, ['Oxygen Saturation_x', 'Oxygen Saturation_y']].mean(axis=1)
+df2 = df2.drop(columns=['Oxygen Saturation_x', 'Oxygen Saturation_y'])
 
 df2.Ethnicity = df2.Ethnicity.astype(str).apply(lambda x: 'White' if 'White' in x else x)
 df2.Ethnicity = df2.Ethnicity.astype(str).apply(lambda x: 'Black' if 'Black' in x else x)
@@ -206,5 +209,7 @@ for c in df2.columns:
     if not is_datetime(df2[c]) and c != 'Ethnicity':
         df2[c] = df2[c].astype(str).str.extract('(\d+)', expand=False).astype(np.float32)
         print(c, is_numeric_dtype(df2[c]))
+
+df2 = df2.groupby('patient_pseudo_id').apply(pd.DataFrame.sort_values, 'CXR_datetime')
 
 df2.to_csv('data_edit_new_extra.csv', index=False)
