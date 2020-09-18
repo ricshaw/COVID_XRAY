@@ -7,12 +7,14 @@ from pandas.api.types import is_numeric_dtype
 from pandas.api.types import is_datetime64_any_dtype as is_datetime
 
 ## Load labs
-df_labs = pd.read_csv('/data/COVID/GSTT/labs_edit.csv')
+#df_labs = pd.read_csv('/data/COVID/GSTT/labs_edit.csv')
+df_labs = pd.read_csv('labs_edit.csv')
 df_labs['CreatedWhen'] = pd.to_datetime(df_labs.CreatedWhen).dt.floor('1D')
 #print(df_labs.head(200))
 
 ## Load data
-df = pd.read_csv('/data/COVID/GSTT/data.csv')
+#df = pd.read_csv('/data/COVID/GSTT/data.csv')
+df = pd.read_csv('data.csv')
 df = df.loc[:, ~df.columns.str.contains('^Unnamed')]
 df = df.rename(columns={'PatientShortId': 'patient_pseudo_id'})
 
@@ -115,6 +117,7 @@ df['Died'] = df['EPR_DateOfDeath']
 df['Died'] = np.where(df['Died'].isnull(), 0, 1)
 
 # New additions
+df[['eNot_SPO2', 'Sym_SPO2']] = df[['eNot_SPO2', 'Sym_SPO2']].apply(pd.to_numeric, errors='coerce')
 df['Oxygen Saturation'] = df.loc[:, ['eNot_SPO2', 'Sym_SPO2']].mean(axis=1)
 # See: https://www.ausmed.co.uk/cpd/articles/oxygen-flow-rate-and-fio2 for conversion
 # FiO2 = ((FR x 100) + ((30 - FR) * 21)) / 30
@@ -127,8 +130,10 @@ df.loc[df['eNot_ACVPU'] == 'New confusion', 'eNot_ACVPU'] = float(temp[temp['Sym
 df.loc[df['eNot_ACVPU'] == 'Voice', 'eNot_ACVPU'] = float(temp[temp['Sym_ACVPU'] == 'Voice']['Sym_GCS'])
 df.loc[df['eNot_ACVPU'] == 'Pain', 'eNot_ACVPU'] = float(temp[temp['Sym_ACVPU'] == 'Pain']['Sym_GCS'])
 
+df[['Sym_GCS', 'eNot_ACVPU']] = df[['Sym_GCS', 'eNot_ACVPU']].apply(pd.to_numeric, errors='coerce')
 df['GCS Score'] = df.loc[:, ['Sym_GCS', 'eNot_ACVPU']].mean(axis=1)
 
+df[['eNot_BloodSugar', 'Sym_BloodSugar']] = df[['eNot_BloodSugar', 'Sym_BloodSugar']].apply(pd.to_numeric, errors='coerce')
 df['Glu1'] = df.loc[:, ['eNot_BloodSugar', 'Sym_BloodSugar']].mean(axis=1)
 
 df['clientvisit_admitdtm'] = df['ICIP_InTime']
@@ -202,4 +207,4 @@ for c in df2.columns:
         df2[c] = df2[c].astype(str).str.extract('(\d+)', expand=False).astype(np.float32)
         print(c, is_numeric_dtype(df2[c]))
 
-df2.to_csv('/data/COVID/GSTT/data_edit_new_extra.csv', index=False)
+df2.to_csv('data_edit_new_extra.csv', index=False)
