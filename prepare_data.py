@@ -2,7 +2,9 @@ import pandas as pd
 import numpy as np
 import os
 from datetime import date
-pd.set_option('display.max_rows', 500)
+#pd.set_option('display.max_rows', 500)
+#pd.set_option('precision', 5)
+#pd.set_option('float_format', '{:f}'.format)
 from pandas.api.types import is_numeric_dtype
 from pandas.api.types import is_datetime64_any_dtype as is_datetime
 
@@ -82,27 +84,46 @@ df = df.rename(columns={'EPR_Age': 'Age',
                         'EPR_Ethnicity': 'Ethnicity',
                         'SpecimenDate_1': 'CreatedWhen'})
 
-## Fix units
+## Height, Weight, BMI
+df[['eNot_Height','MedChart_Height','EPR_Height','ICIP_Height']] = df[['eNot_Height','MedChart_Height','EPR_Height','ICIP_Height']].apply(pd.to_numeric, errors='coerce')
+df[['eNot_Weight','MedChart_Weight','EPR_Weight','ICIP_Weight']] = df[['eNot_Weight','MedChart_Weight','EPR_Weight','ICIP_Weight']].apply(pd.to_numeric, errors='coerce')
+df[['eNot_BMI','EPR_BMI','ICIP_BMI']] = df[['eNot_BMI','EPR_BMI','ICIP_BMI']].apply(pd.to_numeric, errors='coerce')
 df['eNot_Height'] = df['eNot_Height'] * 100.0
+df['Height'] = df.loc[:, ['eNot_Height','MedChart_Height','EPR_Height','ICIP_Height']].mean(axis=1)
+df['Weight'] = df.loc[:, ['eNot_Weight','MedChart_Weight','EPR_Weight','ICIP_Weight']].mean(axis=1)
+df['BMI'] = df.loc[:, ['eNot_BMI','EPR_BMI','ICIP_BMI']].mean(axis=1)
+df[['Height','Weight','BMI']].replace(0, np.nan, inplace=True)
+df.BMI = df.BMI.combine_first(df['Weight'] / (df['Height']/100.0)**2)
+df.Height = df.Height.combine_first(np.sqrt(df['Weight'] / df['BMI'])*100.0)
+df.Weight = df.Weight.combine_first(df['BMI'] * (df['Height']/100.0)**2)
 
-## Combine columns with mean values
-df['Height'] = df.loc[:, ['eNot_Height', 'MedChart_Height', 'EPR_Height', 'ICIP_Height']].mean(axis=1)
-df['Weight'] = df.loc[:, ['eNot_Weight', 'MedChart_Weight', 'EPR_Weight', 'ICIP_Weight']].mean(axis=1)
-df['BMI'] = df.loc[:, ['eNot_BMI','EPR_BMI', 'ICIP_BMI']].mean(axis=1)
-df['NEWS2'] = df.loc[:, ['eNot_NEWS2', 'Sym_NEWS2']].mean(axis=1)
-df['Temperature'] = df.loc[:, ['eNot_Temp', 'Sym_Temp']].mean(axis=1)
+df[['eNot_NEWS2','Sym_NEWS2']] = df[['eNot_NEWS2','Sym_NEWS2']].apply(pd.to_numeric, errors='coerce')
+df['NEWS2'] = df.loc[:, ['eNot_NEWS2','Sym_NEWS2']].mean(axis=1)
+
+df[['eNot_Temp','Sym_Temp']] = df[['eNot_Temp','Sym_Temp']].apply(pd.to_numeric, errors='coerce')
+df['Temperature'] = df.loc[:, ['eNot_Temp','Sym_Temp']].mean(axis=1)
+
 df['Urea'] = df['EPR_UreaLevel']
 df['Sodium'] = df['EPR_SodiumLevel']
 #df['Calcium'] = df['EPR_CorrectedCalciumLevel']
 #df['Potassium'] = df['EPR_PotassiumLevel']
-df['Systolic BP'] = df.loc[:, ['eNot_BPSys', 'Sym_BPSys']].mean(axis=1)
-df['Diastolic BP'] = df.loc[:, ['eNot_BPDiast', 'Sym_BPDiast']].mean(axis=1)
-df['Respiration Rate'] = df.loc[:, ['eNot_RespRate', 'Sym_RespRate']].mean(axis=1)
+
+df[['eNot_BPSys','Sym_BPSys']] = df[['eNot_BPSys','Sym_BPSys']].apply(pd.to_numeric, errors='coerce')
+df['Systolic BP'] = df.loc[:, ['eNot_BPSys','Sym_BPSys']].mean(axis=1)
+
+df[['eNot_BPDiast','Sym_BPDiast']] = df[['eNot_BPDiast','Sym_BPDiast']].apply(pd.to_numeric, errors='coerce')
+df['Diastolic BP'] = df.loc[:, ['eNot_BPDiast','Sym_BPDiast']].mean(axis=1)
+
+df[['eNot_RespRate','Sym_RespRate']] = df[['eNot_RespRate','Sym_RespRate']].apply(pd.to_numeric, errors='coerce')
+df['Respiration Rate'] = df.loc[:, ['eNot_RespRate','Sym_RespRate']].mean(axis=1)
+
+df[['eNot_Pulse','Sym_Pulse']] = df[['eNot_Pulse','Sym_Pulse']].apply(pd.to_numeric, errors='coerce')
+df['Heart Rate'] = df.loc[:, ['eNot_Pulse','Sym_Pulse']].mean(axis=1)
+
 df['Bilirubin'] = df['EPR_BilirubinLevel']
 df['Albumin'] = df['EPR_AlbuminLevel']
 df['Alkaline Phosphatase'] = df['EPR_AlkPhosLevel']
 df['Lymphocytes'] = df['EPR_Lymphocytes']
-df['Heart Rate'] = df.loc[:, ['eNot_Pulse', 'Sym_Pulse']].mean(axis=1)
 # df['GCS Score'] = df.loc[:, ['Sym_GCS']].mean(axis=1)
 df['CRP'] = df['EPR_CRP']
 df['Troponin'] = df['EPR_Troponin']
@@ -116,8 +137,8 @@ df['Died'] = df['EPR_DateOfDeath']
 df['Died'] = np.where(df['Died'].isnull(), 0, 1)
 
 # New additions
-df[['eNot_SPO2', 'Sym_SPO2']] = df[['eNot_SPO2', 'Sym_SPO2']].apply(pd.to_numeric, errors='coerce')
-df['Oxygen Saturation'] = df.loc[:, ['eNot_SPO2', 'Sym_SPO2']].mean(axis=1)
+df[['eNot_SPO2','Sym_SPO2']] = df[['eNot_SPO2','Sym_SPO2']].apply(pd.to_numeric, errors='coerce')
+df['Oxygen Saturation'] = df.loc[:, ['eNot_SPO2','Sym_SPO2']].mean(axis=1)
 # See: https://www.ausmed.co.uk/cpd/articles/oxygen-flow-rate-and-fio2 for conversion
 # FiO2 = ((FR x 100) + ((30 - FR) * 21)) / 30
 df['FiO2'] = ((df['Sym_O2Amount'] * 100) + ((df['Respiration Rate'] - df['Sym_O2Amount']) * 21)) / df['Respiration Rate']
@@ -129,11 +150,11 @@ df.loc[df['eNot_ACVPU'] == 'New confusion', 'eNot_ACVPU'] = float(temp[temp['Sym
 df.loc[df['eNot_ACVPU'] == 'Voice', 'eNot_ACVPU'] = float(temp[temp['Sym_ACVPU'] == 'Voice']['Sym_GCS'])
 df.loc[df['eNot_ACVPU'] == 'Pain', 'eNot_ACVPU'] = float(temp[temp['Sym_ACVPU'] == 'Pain']['Sym_GCS'])
 
-df[['Sym_GCS', 'eNot_ACVPU']] = df[['Sym_GCS', 'eNot_ACVPU']].apply(pd.to_numeric, errors='coerce')
-df['GCS Score'] = df.loc[:, ['Sym_GCS', 'eNot_ACVPU']].mean(axis=1)
+df[['Sym_GCS','eNot_ACVPU']] = df[['Sym_GCS','eNot_ACVPU']].apply(pd.to_numeric, errors='coerce')
+df['GCS Score'] = df.loc[:, ['Sym_GCS','eNot_ACVPU']].mean(axis=1)
 
-df[['eNot_BloodSugar', 'Sym_BloodSugar']] = df[['eNot_BloodSugar', 'Sym_BloodSugar']].apply(pd.to_numeric, errors='coerce')
-df['Glu1'] = df.loc[:, ['eNot_BloodSugar', 'Sym_BloodSugar']].mean(axis=1)
+df[['eNot_BloodSugar','Sym_BloodSugar']] = df[['eNot_BloodSugar','Sym_BloodSugar']].apply(pd.to_numeric, errors='coerce')
+df['Glu1'] = df.loc[:, ['eNot_BloodSugar','Sym_BloodSugar']].mean(axis=1)
 
 df['clientvisit_admitdtm'] = df['ICIP_InTime']
 df['clientvisit_dischargedtm'] = df['ICIP_OutTime']
@@ -202,11 +223,16 @@ df2.Ethnicity = df2.Ethnicity.astype(str).apply(lambda x: 'Other' if 'Other' in 
 df2.Ethnicity = df2.Ethnicity.astype(str).apply(lambda x: 'Unknown' if 'Not Stated' in x else x)
 print(df2.Ethnicity.unique())
 
+
 ## Remove any bad strings
 for c in df2.columns:
     if not is_datetime(df2[c]) and c != 'Ethnicity':
         df2[c] = df2[c].astype(str).str.extract('(\d+)', expand=False).astype(np.float32)
+        #df2[c] = df2[c].astype(str).str.replace(r'\D', '')
+        #df2[c] = df2[c].astype(str).str.replace("\D^.", "").astype(np.float32)
         print(c, is_numeric_dtype(df2[c]))
+
+print(df2.head(50))
 
 ## Sort by time
 df2 = df2.groupby('patient_pseudo_id').apply(pd.DataFrame.sort_values, 'CXR_datetime')
