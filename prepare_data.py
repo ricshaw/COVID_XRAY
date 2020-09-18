@@ -7,18 +7,18 @@ from pandas.api.types import is_numeric_dtype
 from pandas.api.types import is_datetime64_any_dtype as is_datetime
 
 ## Load labs
-df_labs = pd.read_csv('/data/COVID/GSTT/labs_edit.csv')
-#df_labs = pd.read_csv('labs_edit.csv')
+#df_labs = pd.read_csv('/data/COVID/GSTT/labs_edit.csv')
+df_labs = pd.read_csv('labs_edit.csv')
 df_labs['CreatedWhen'] = pd.to_datetime(df_labs.CreatedWhen).dt.floor('1D')
 #print(df_labs.head(200))
 
 ## Load data
-df = pd.read_csv('/data/COVID/GSTT/data.csv')
-#df = pd.read_csv('data.csv')
+#df = pd.read_csv('/data/COVID/GSTT/data.csv')
+df = pd.read_csv('data.csv')
 df = df.loc[:, ~df.columns.str.contains('^Unnamed')]
 df = df.rename(columns={'PatientShortId': 'patient_pseudo_id'})
 
-## Convert to datetime
+## Convert to spcecimen dates to datetime (Days)
 df.SpecimenDate_1 = pd.to_datetime(df.SpecimenDate_1).dt.floor('1D')
 df.SpecimenDate_2 = pd.to_datetime(df.SpecimenDate_2).dt.floor('1D')
 df.SpecimenDate_3 = pd.to_datetime(df.SpecimenDate_3).dt.floor('1D')
@@ -76,17 +76,16 @@ df = df[df['CreatedWhen'].notna()]
 df = df.dropna(subset=all_cols, how='all')
 df.to_csv('data_tmp.csv', index=False)
 
+## Rename columns
 df = df.rename(columns={'EPR_Age': 'Age',
                         'EPR_Gender': 'Gender',
                         'EPR_Ethnicity': 'Ethnicity',
                         'SpecimenDate_1': 'CreatedWhen'})
+
+## Fix units
 df['eNot_Height'] = df['eNot_Height'] * 100.0
 
-#df['Height'] = df['eNot_Height'].fillna(df['MedChart_Height']).fillna(df['EPR_Height'])
-#df['Weight'] = df['eNot_Weight'].fillna(df['MedChart_Weight'])
-#df['BMI'] = df['eNot_BMI'].fillna(df['EPR_BMI'])
-#df['NEWS2'] = df['eNot_NEWS2'].fillna(df['Sym_NEWS2'])
-
+## Combine columns with mean values
 df['Height'] = df.loc[:, ['eNot_Height', 'MedChart_Height', 'EPR_Height', 'ICIP_Height']].mean(axis=1)
 df['Weight'] = df.loc[:, ['eNot_Weight', 'MedChart_Weight', 'EPR_Weight', 'ICIP_Weight']].mean(axis=1)
 df['BMI'] = df.loc[:, ['eNot_BMI','EPR_BMI', 'ICIP_BMI']].mean(axis=1)
@@ -183,7 +182,7 @@ df1 = df[['patient_pseudo_id',
 ]]
 print(df1.head(50))
 
-## Merge with labs
+## Merge with labs data
 df1 = df1.reset_index(drop=True)
 df_labs = df_labs.reset_index(drop=True)
 df2 = pd.merge_asof(df1.sort_values('CreatedWhen'), df_labs.sort_values('CreatedWhen'), on='CreatedWhen', by='patient_pseudo_id')
@@ -194,6 +193,7 @@ df2 = df2.rename(columns={'CreatedWhen': 'CXR_datetime'})
 df2['Oxygen Saturation'] = df2.loc[:, ['Oxygen Saturation_x', 'Oxygen Saturation_y']].mean(axis=1)
 df2 = df2.drop(columns=['Oxygen Saturation_x', 'Oxygen Saturation_y'])
 
+## Fix ethnicity values
 df2.Ethnicity = df2.Ethnicity.astype(str).apply(lambda x: 'White' if 'White' in x else x)
 df2.Ethnicity = df2.Ethnicity.astype(str).apply(lambda x: 'Black' if 'Black' in x else x)
 df2.Ethnicity = df2.Ethnicity.astype(str).apply(lambda x: 'Asian' if 'Asian' in x else x)
@@ -202,14 +202,21 @@ df2.Ethnicity = df2.Ethnicity.astype(str).apply(lambda x: 'Other' if 'Other' in 
 df2.Ethnicity = df2.Ethnicity.astype(str).apply(lambda x: 'Unknown' if 'Not Stated' in x else x)
 print(df2.Ethnicity.unique())
 
-print(df2.head(20))
-print(df2.shape)
-
+## Remove any bad strings
 for c in df2.columns:
     if not is_datetime(df2[c]) and c != 'Ethnicity':
         df2[c] = df2[c].astype(str).str.extract('(\d+)', expand=False).astype(np.float32)
         print(c, is_numeric_dtype(df2[c]))
 
+## Sort by time
 df2 = df2.groupby('patient_pseudo_id').apply(pd.DataFrame.sort_values, 'CXR_datetime')
+df2 = df2.reset_index(drop=True)
 
+## Fill missing
+if True:
+    df2 = df2.set_index('patient_pseudo_id').groupby(level='patient_pseudo_id').ffill().reset_index()
+    df2 = df2.set_index('patient_pseudo_id').groupby(level='patient_pseudo_id').bfill().reset_index()
+print(df2.head(20))
+
+## Save
 df2.to_csv('data_edit_new_extra.csv', index=False)
