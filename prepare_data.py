@@ -96,6 +96,7 @@ df[['Height','Weight','BMI']].replace(0, np.nan, inplace=True)
 df.BMI = df.BMI.combine_first(df['Weight'] / (df['Height']/100.0)**2)
 df.Height = df.Height.combine_first(np.sqrt(df['Weight'] / df['BMI'])*100.0)
 df.Weight = df.Weight.combine_first(df['BMI'] * (df['Height']/100.0)**2)
+df = df.replace([np.inf, -np.inf], np.nan)
 
 df[['eNot_NEWS2','Sym_NEWS2']] = df[['eNot_NEWS2','Sym_NEWS2']].apply(pd.to_numeric, errors='coerce')
 df['NEWS2'] = df.loc[:, ['eNot_NEWS2','Sym_NEWS2']].mean(axis=1)
@@ -227,7 +228,8 @@ print(df2.Ethnicity.unique())
 ## Remove any bad strings
 for c in df2.columns:
     if not is_datetime(df2[c]) and c != 'Ethnicity':
-        #df2[c] = df2[c].astype(str).str.extract('(\d+)', expand=False).astype(np.float32)
+        df2[c] = df2[c].apply(lambda x: float(x[1:]) if str(x).startswith('<') else x)
+        df2[c] = df2[c].apply(lambda x: float(x[1:]) if str(x).startswith('>') else x)
         df2[c] = df2[c].apply(pd.to_numeric, errors='coerce')
         print(c, is_numeric_dtype(df2[c]))
 
@@ -244,4 +246,4 @@ if True:
 print(df2.head(20))
 
 ## Save
-df2.to_csv('data_edit_new_extra.csv', index=False)
+df2.to_csv('gstt.csv', index=False)

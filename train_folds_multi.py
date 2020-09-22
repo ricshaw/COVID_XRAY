@@ -65,19 +65,19 @@ seed_everything(42)
 ## Config
 data = '/nfs/home/richard/COVID_XRAY/cxr_news2_pseudonymised_filenames_folds.csv'
 test_data = '/nfs/home/richard/COVID_XRAY/gstt.csv'
-#test_data = '/nfs/home/richard/COVID_XRAY/gstt_new.csv'
 encoder = 'efficientnet-b0'
-IMAGES = True
+IMAGES = False
 FEATS = True
-MULTI = True
-EPOCHS = 30
-MIN_EPOCHS = 30
+MULTI = False
+LATEST = True
+EPOCHS = 50
+MIN_EPOCHS = 50
 PATIENCE = 5
-bs = 64
+bs = 128
 input_size = (256,256)
 FOLDS = 5
 gamma = 2.0
-CENTRE_CROP = False
+CENTRE_CROP = True
 CUTMIX_PROB = 0.0
 OCCLUSION = False
 SAVE = True
@@ -94,21 +94,30 @@ if SAVE:
     os.makedirs(SAVE_PATH, exist_ok=True)
 
 
+def get_latest(df):
+    df['CXR_datetime'] = pd.to_datetime(df.CXR_datetime, dayfirst=True)
+    df = df.groupby('patient_pseudo_id').apply(pd.DataFrame.sort_values, 'CXR_datetime', ascending=False).reset_index(drop=True)
+    return df.drop_duplicates(subset='patient_pseudo_id', keep='first').reset_index(drop=True)
+
 ## Load train data
 df = pd.read_csv(data)
+if LATEST:
+    df = get_latest(df)
+
 print('Train data:', df.shape)
-print(df.head())
+print(df.head(20))
 print('Number of images:', df.shape[0])
 print('Died:', df[df.Died == 1].shape[0])
 print('Survived:', df[df.Died == 0].shape[0])
 
 ## Load test data
 test_df = pd.read_csv(test_data)
+if LATEST:
+    test_df = get_latest(test_df)
 print('Test data:', test_df.shape)
 tmp = test_df.drop(columns=['patient_pseudo_id','CXR_datetime','Age','Gender','Ethnicity','Died'])
 bloods_cols = tmp.columns
 print('Bloods:', bloods_cols)
-
 
 def new_section(text):
     print('\n')
@@ -137,10 +146,10 @@ def prepare_data(df, bloods_cols):
     # Extract features
     bloods = df.loc[:,bloods_cols].values.astype(np.float32)
     print('Bloods', bloods.shape)
-    age = df.Age[:,None]
-    gender = df.Gender[:,None]
-    ethnicity = df.Ethnicity[:,None]
-    time = df.rel_datetime[:,None]
+    age = df.Age.values[:,None]
+    gender = df.Gender.values[:,None]
+    ethnicity = df.Ethnicity.values[:,None]
+    time = df.rel_datetime.values[:,None]
 
     # Normalise features
     scaler = StandardScaler()
@@ -304,7 +313,7 @@ class Swish_Module(nn.Module):
         return Swish.apply(x)
 
 class SingleModel(nn.Module):
-    def __init__(self, encoder='efficientnet-b0', nfeats=31):
+    def __init__(self, encoder='efficientnet-b0', nfeats=33):
         super(SingleModel, self).__init__()
         n_channels_dict = {'efficientnet-b0': 1280, 'efficientnet-b1': 1280, 'efficientnet-b2': 1408,
                            'efficientnet-b3': 1536, 'efficientnet-b4': 1792, 'efficientnet-b5': 2048,
@@ -519,8 +528,8 @@ for fold in range(FOLDS):
     train_loader = DataLoader(train_dataset, batch_size=bs, num_workers=4, shuffle=True, drop_last=True)
 
     ## Val dataser
-    #val_dataset = ImageDataset(val_df, tta_transform)
-    #val_loader = DataLoader(val_dataset, batch_size=4, num_workers=4)
+    val_dataset = SingleImageDataset(val_df, tta_transform)
+    val_loader = DataLoader(val_dataset, batch_size=8, num_workers=4)
 
     ## Init model
     singlemodel = SingleModel(encoder).cuda()
@@ -559,11 +568,9 @@ for fold in range(FOLDS):
                 time1, time2 = sample[5], sample[6]
                 labels = sample[7].cuda()
             else:
-                image1 = sample[1].cuda()
-                feats1 = sample[2].cuda()
+                image1, image2 = sample[1].cuda(), None
+                feats1, feats2 = sample[2].cuda(), None
                 labels = sample[3].cuda()
-                image2 = None
-                feats2 = None
             labels = labels.unsqueeze(1).float()
             #print('image1', image1, 'feats1', feats1, 'image2', image2, 'feats2', feats2)
 
@@ -636,75 +643,91 @@ for fold in range(FOLDS):
         res_label = []
         count = 0
         with torch.no_grad():
-            for pid in val_df['patient_pseudo_id'].unique():
-                #print(pid)
-                pid_df = val_df[val_df['patient_pseudo_id']==pid].reset_index(drop=True)
-                pid_df['CXR_datetime'] = pd.to_datetime(pid_df.CXR_datetime, dayfirst=True)
-                pid_df = pid_df.sort_values(by=['CXR_datetime'], ascending=True).reset_index(drop=True)
-                n_images = pid_df.shape[0]
-                #print(n_images, 'images')
-                ind1=0
-                ind2=n_images-1
-                time1 = pid_df.rel_datetime[ind1].astype(np.float32)
-                time2 = pid_df.rel_datetime[ind2].astype(np.float32)
-                image1, image2 = np.array([]), np.array([])
-                feats1, feats2 = np.array([]), np.array([])
-                if FEATS:
-                    # Features
-                    feats1 = get_feats(pid_df, ind1, aug=False)
-                    feats2 = get_feats(pid_df, ind2, aug=False)
-                    feats1 = np.append(feats1, time1)
-                    feats2 = np.append(feats2, time2)
-                else:
+            if MULTI:
+                for pid in val_df['patient_pseudo_id'].unique():
+                    #print(pid)
+                    pid_df = val_df[val_df['patient_pseudo_id']==pid].reset_index(drop=True)
+                    pid_df['CXR_datetime'] = pd.to_datetime(pid_df.CXR_datetime, dayfirst=True)
+                    pid_df = pid_df.sort_values(by=['CXR_datetime'], ascending=True).reset_index(drop=True)
+                    n_images = pid_df.shape[0]
+                    ind1=0
+                    ind2=n_images-1
+                    time1 = pid_df.rel_datetime[ind1].astype(np.float32)
+                    time2 = pid_df.rel_datetime[ind2].astype(np.float32)
+                    image1, image2 = np.array([]), np.array([])
                     feats1, feats2 = np.array([]), np.array([])
-                if IMAGES:
-                    # Image
-                    image1 = get_image(pid_df, ind1, tta_transform)
-                    image2 = get_image(pid_df, ind2, tta_transform)
-                else:
-                    image1, image2 = torch.FloatTensor(), torch.FloatTensor()
-                # Label
-                labels = pid_df.Died[ind1]
-                labels = torch.Tensor([labels]).cuda()
+                    if FEATS:
+                        # Features
+                        feats1 = get_feats(pid_df, ind1, aug=False)
+                        feats2 = get_feats(pid_df, ind2, aug=False)
+                        feats1 = np.append(feats1, time1)
+                        feats2 = np.append(feats2, time2)
+                    else:
+                        feats1, feats2 = np.array([]), np.array([])
+                    if IMAGES:
+                        # Image
+                        image1 = get_image(pid_df, ind1, tta_transform)
+                        image2 = get_image(pid_df, ind2, tta_transform)
+                    else:
+                        image1, image2 = torch.FloatTensor(), torch.FloatTensor()
+                    # Label
+                    labels = pid_df.Died[ind1]
+                    labels = torch.Tensor([labels]).cuda()
 
-                image1, image2 = image1.cuda(), image2.cuda()
-                image1, image2 = image1.unsqueeze(0), image2.unsqueeze(0)
-                feats1, feats2 = torch.Tensor(feats1).cuda(), torch.Tensor(feats2).cuda()
-                feats1, feats2 = feats1.unsqueeze(0), feats2.unsqueeze(0)
-                labels = labels.unsqueeze(1).float()
-                #print(image1.shape, image2.shape, feats1.shape, feats2.shape, labels.shape)
+                    image1, image2 = image1.cuda(), image2.cuda()
+                    image1, image2 = image1.unsqueeze(0), image2.unsqueeze(0)
+                    feats1, feats2 = torch.Tensor(feats1).cuda(), torch.Tensor(feats2).cuda()
+                    feats1, feats2 = feats1.unsqueeze(0), feats2.unsqueeze(0)
+                    labels = labels.unsqueeze(1).float()
+                    #print(image1.shape, image2.shape, feats1.shape, feats2.shape, labels.shape)
 
-                ## TTA
-                if len(image1.size())==5:
-                     batch_size, n_crops, c, h, w = image1.size()
-                     image1 = image1.view(-1, c, h, w)
-                     image2 = image2.view(-1, c, h, w)
-                     if FEATS:
-                         _, n_feats = feats1.size()
-                         feats1 = feats1.repeat(1,n_crops).view(-1,n_feats)
-                         feats2 = feats2.repeat(1,n_crops).view(-1,n_feats)
-                     out = model(image1, feats1, image2, feats2)
-                     out = out.view(batch_size, n_crops, -1).mean(1)
-                else:
-                     out = model(image1, feats1, image2, feats2)
-
-                #loss = criterion(out.data, labels)
-                loss = sigmoid_focal_loss(out, labels, alpha=alpha, gamma=gamma, reduction="mean")
-                running_loss += loss.item()
-
-                total += labels.size(0)
-                out = torch.sigmoid(out)
-                correct += ((out > 0.5).int() == labels).sum().item()
-
-                res_prob += out.cpu().numpy().tolist()
-                res_label += labels.cpu().numpy().tolist()
-                res_name += [pid]
-
-                #if OCCLUSION and (count==0):
-                #    images = images.view(batch_size, n_crops, -1)[:,0,...]
-                #    oc_images = images[(labels==1).squeeze()].cuda()
-                #    oc_labels = labels[(labels==1).squeeze()].cuda()
-                #count += 1
+                    ## TTA
+                    if len(image1.size())==5:
+                        batch_size, n_crops, c, h, w = image1.size()
+                        image1 = image1.view(-1, c, h, w)
+                        image2 = image2.view(-1, c, h, w)
+                        if FEATS:
+                            _, n_feats = feats1.size()
+                            feats1 = feats1.repeat(1,n_crops).view(-1,n_feats)
+                            feats2 = feats2.repeat(1,n_crops).view(-1,n_feats)
+                        out = model(image1, feats1, image2, feats2)
+                        out = out.view(batch_size, n_crops, -1).mean(1)
+                    else:
+                        out = model(image1, feats1, image2, feats2)
+                    loss = sigmoid_focal_loss(out, labels, alpha=alpha, gamma=gamma, reduction="mean")
+                    running_loss += loss.item()
+                    total += labels.size(0)
+                    out = torch.sigmoid(out)
+                    correct += ((out > 0.5).int() == labels).sum().item()
+                    res_prob += out.cpu().numpy().tolist()
+                    res_label += labels.cpu().numpy().tolist()
+                    res_name += [pid]
+            else:
+                for i, sample in enumerate(val_loader):
+                    pid = sample[0]
+                    image1, image2 = sample[1].cuda(), None
+                    feats1, feats2 = sample[2].cuda(), None
+                    labels = sample[3].cuda()
+                    labels = labels.unsqueeze(1).float()
+                    ## TTA
+                    if len(image1.size())==5:
+                        batch_size, n_crops, c, h, w = image1.size()
+                        image1 = image1.view(-1, c, h, w)
+                        if FEATS:
+                            _, n_feats = feats1.size()
+                            feats1 = feats1.repeat(1,n_crops).view(-1,n_feats)
+                        out = model(image1, feats1, image2, feats2)
+                        out = out.view(batch_size, n_crops, -1).mean(1)
+                    else:
+                        out = model(image1, feats1, image2, feats2)
+                    loss = sigmoid_focal_loss(out, labels, alpha=alpha, gamma=gamma, reduction="mean")
+                    running_loss += loss.item()
+                    total += labels.size(0)
+                    out = torch.sigmoid(out)
+                    correct += ((out > 0.5).int() == labels).sum().item()
+                    res_prob += out.cpu().numpy().tolist()
+                    res_label += labels.cpu().numpy().tolist()
+                    res_name += pid
 
         # Scores
         acc = correct/total
@@ -838,6 +861,10 @@ new_section('Testing!')
 test_df = prepare_data(test_df, bloods_cols)
 print('Test data:', test_df.shape)
 
+if not MULTI:
+    test_dataset = SingleImageDataset(test_df, tta_transform)
+    test_loader = DataLoader(test_dataset, batch_size=8, num_workers=4)
+
 y_pred = 0
 test_accs = []
 test_aucs = []
@@ -854,62 +881,82 @@ for fold in range(FOLDS):
     model.cuda()
     model.eval()
     with torch.no_grad():
-        for pid in test_df['patient_pseudo_id'].unique():
-            #print(pid)
-            pid_df = test_df[test_df['patient_pseudo_id']==pid].reset_index(drop=True)
-            pid_df['CXR_datetime'] = pd.to_datetime(pid_df.CXR_datetime, dayfirst=True)
-            pid_df = pid_df.sort_values(by=['CXR_datetime'], ascending=True).reset_index(drop=True)
-            n_images = pid_df.shape[0]
-            #print(n_images, 'images')
-            ind1 = 0
-            ind2 = n_images-1
-            time1 = pid_df.rel_datetime[ind1].astype(np.float32)
-            time2 = pid_df.rel_datetime[ind2].astype(np.float32)
-            image1, image2 = np.array([]), np.array([])
-            feats1, feats2 = np.array([]), np.array([])
-            if FEATS:
-                # Features
-                feats1 = get_feats(pid_df, ind1, aug=False)
-                feats2 = get_feats(pid_df, ind2, aug=False)
-                feats1 = np.append(feats1, time1)
-                feats2 = np.append(feats2, time2)
-            else:
+        if MULTI:
+            for pid in test_df['patient_pseudo_id'].unique():
+                pid_df = test_df[test_df['patient_pseudo_id']==pid].reset_index(drop=True)
+                pid_df['CXR_datetime'] = pd.to_datetime(pid_df.CXR_datetime, dayfirst=True)
+                pid_df = pid_df.sort_values(by=['CXR_datetime'], ascending=True).reset_index(drop=True)
+                n_images = pid_df.shape[0]
+                ind1 = 0
+                ind2 = n_images-1
+                time1 = pid_df.rel_datetime[ind1].astype(np.float32)
+                time2 = pid_df.rel_datetime[ind2].astype(np.float32)
+                image1, image2 = np.array([]), np.array([])
                 feats1, feats2 = np.array([]), np.array([])
-            if IMAGES:
-                # Image
-                image1 = get_image(pid_df, ind1, tta_transform)
-                image2 = get_image(pid_df, ind2, tta_transform)
-            else:
-                image1, image2 = torch.FloatTensor(), torch.FloatTensor()
-            # Label
-            labels = pid_df.Died[ind1]
-            labels = torch.Tensor([labels]).cuda()
-
-            image1, image2 = image1.cuda(), image2.cuda()
-            image1, image2 = image1.unsqueeze(0), image2.unsqueeze(0)
-            feats1, feats2 = torch.Tensor(feats1).cuda(), torch.Tensor(feats2).cuda()
-            feats1, feats2 = feats1.unsqueeze(0), feats2.unsqueeze(0)
-            labels = labels.unsqueeze(1).float()
-            #print(image1.shape, image2.shape, feats1.shape, feats2.shape, labels.shape)
-
-            ## TTA
-            if len(image1.size())==5:
-                batch_size, n_crops, c, h, w = image1.size()
-                image1 = image1.view(-1, c, h, w)
-                image2 = image2.view(-1, c, h, w)
                 if FEATS:
-                    _, n_feats = feats1.size()
-                    feats1 = feats1.repeat(1,n_crops).view(-1,n_feats)
-                    feats2 = feats2.repeat(1,n_crops).view(-1,n_feats)
-                out = model(image1, feats1, image2, feats2)
-                out = out.view(batch_size, n_crops, -1).mean(1)
-            else:
-                out = model(image1, feats1, image2, feats2)
+                    # Features
+                    feats1 = get_feats(pid_df, ind1, aug=False)
+                    feats2 = get_feats(pid_df, ind2, aug=False)
+                    feats1 = np.append(feats1, time1)
+                    feats2 = np.append(feats2, time2)
+                else:
+                    feats1, feats2 = np.array([]), np.array([])
+                if IMAGES:
+                    # Image
+                    image1 = get_image(pid_df, ind1, tta_transform)
+                    image2 = get_image(pid_df, ind2, tta_transform)
+                else:
+                    image1, image2 = torch.FloatTensor(), torch.FloatTensor()
+                # Label
+                labels = pid_df.Died[ind1]
+                labels = torch.Tensor([labels]).cuda()
+                image1, image2 = image1.cuda(), image2.cuda()
+                image1, image2 = image1.unsqueeze(0), image2.unsqueeze(0)
+                feats1, feats2 = torch.Tensor(feats1).cuda(), torch.Tensor(feats2).cuda()
+                feats1, feats2 = feats1.unsqueeze(0), feats2.unsqueeze(0)
+                labels = labels.unsqueeze(1).float()
+                #print(image1.shape, image2.shape, feats1.shape, feats2.shape, labels.shape)
 
-            out = torch.sigmoid(out)
-            res_prob += out.cpu().numpy().tolist()
-            res_label += labels.cpu().numpy().tolist()
-            res_name += [pid]
+                ## TTA
+                if len(image1.size())==5:
+                    batch_size, n_crops, c, h, w = image1.size()
+                    image1 = image1.view(-1, c, h, w)
+                    image2 = image2.view(-1, c, h, w)
+                    if FEATS:
+                        _, n_feats = feats1.size()
+                        feats1 = feats1.repeat(1,n_crops).view(-1,n_feats)
+                        feats2 = feats2.repeat(1,n_crops).view(-1,n_feats)
+                    out = model(image1, feats1, image2, feats2)
+                    out = out.view(batch_size, n_crops, -1).mean(1)
+                else:
+                    out = model(image1, feats1, image2, feats2)
+
+                out = torch.sigmoid(out)
+                res_prob += out.cpu().numpy().tolist()
+                res_label += labels.cpu().numpy().tolist()
+                res_name += [pid]
+        else:
+            for i, sample in enumerate(test_loader):
+                pid = sample[0]
+                image1, image2 = sample[1].cuda(), None
+                feats1, feats2 = sample[2].cuda(), None
+                labels = sample[3].cuda()
+                labels = labels.unsqueeze(1).float()
+                ## TTA
+                if len(image1.size())==5:
+                    batch_size, n_crops, c, h, w = image1.size()
+                    image1 = image1.view(-1, c, h, w)
+                    if FEATS:
+                        _, n_feats = feats1.size()
+                        feats1 = feats1.repeat(1,n_crops).view(-1,n_feats)
+                    out = model(image1, feats1, image2, feats2)
+                    out = out.view(batch_size, n_crops, -1).mean(1)
+                else:
+                    out = model(image1, feats1, image2, feats2)
+                out = torch.sigmoid(out)
+                res_prob += out.cpu().numpy().tolist()
+                res_label += labels.cpu().numpy().tolist()
+                res_name += pid
 
         res_label = np.array(res_label)
         res_prob = np.array(res_prob)
