@@ -6,7 +6,6 @@ import os
 import cv2
 import sys
 import random
-#import pydicom
 import pandas as pd
 from PIL import Image
 from PIL.Image import fromarray
@@ -15,7 +14,7 @@ from sklearn import linear_model
 from sklearn import metrics
 from skimage.transform import resize
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, balanced_accuracy_score
 from sklearn.metrics import roc_curve, auc, roc_auc_score, average_precision_score
 from sklearn.metrics import precision_recall_curve, plot_precision_recall_curve
 from sklearn.preprocessing import StandardScaler
@@ -39,6 +38,27 @@ from focal_loss import sigmoid_focal_loss, sigmoid_focal_loss_star
 sys.path.append('/nfs/home/richard/over9000')
 from over9000 import RangerLars
 
+import runai.hpo
+strategy = runai.hpo.Strategy.GridSearch
+runai.hpo.init('/nfs/project/richard', 'bloods-only')
+if True:
+    config = runai.hpo.pick(
+    grid=dict(
+            batch_size=[32, 64, 128],
+            lr=[0.1, 0.01, 0.001],
+            aug=[0.1, 0.2, 0.3],
+            chns=[64, 128, 256],
+            dropout=[0.1, 0.2, 0.3, 0.4, 0.5]),
+    strategy=strategy)
+else:
+    config = runai.hpo.pick(
+    grid=dict(
+            batch_size=[64],
+            lr=[0.1],
+            aug=[0.1],
+            chns=[256],
+            dropout=[0.5]),
+    strategy=strategy)
 #from captum.attr import (
 #    GradientShap,
 #    DeepLift,
@@ -64,16 +84,23 @@ seed_everything(42)
 
 ## Config
 data = '/nfs/home/richard/COVID_XRAY/cxr_news2_pseudonymised_filenames_folds.csv'
-test_data = '/nfs/home/richard/COVID_XRAY/gstt.csv'
+test_data = '/nfs/home/richard/COVID_XRAY/new_gstt.csv'
 encoder = 'efficientnet-b0'
+
 IMAGES = False
 FEATS = True
 MULTI = False
-LATEST = True
-EPOCHS = 50
-MIN_EPOCHS = 50
+LATEST = False
+VAL_MODE = 'ALL' # ALL / FIRST_LAST / LATEST
+
+EPOCHS = 100 #50
+MIN_EPOCHS = 100 #50
 PATIENCE = 5
-bs = 128
+bs = config['batch_size']
+LR = config['lr']
+chns = config['chns']
+dp = config['dropout']
+blood_aug = config['aug']
 input_size = (256,256)
 FOLDS = 5
 gamma = 2.0
@@ -81,11 +108,15 @@ CENTRE_CROP = True
 CUTMIX_PROB = 0.0
 OCCLUSION = False
 SAVE = True
-SAVE_NAME = 'multi_' + encoder + '-bs%d-%d' % (bs, input_size[0])
+SAVE_NAME = encoder + '-bs%d-lr%.1E' % (bs, LR)
+if MULTI:
+    SAVE_NAME += '_multi'
 if IMAGES:
-    SAVE_NAME += '_images'
+    SAVE_NAME += '_images-%d' % input_size[0]
 if FEATS:
-    SAVE_NAME += '_feats'
+    SAVE_NAME += '_feats-chns%d-dp%.1f-aug%.1f' % (chns, dp, blood_aug)
+if LATEST:
+    SAVE_NAME += '_latest'
 SAVE_PATH = '/nfs/home/richard/COVID_XRAY/' + SAVE_NAME
 print(SAVE_NAME)
 log_name = './runs/' + SAVE_NAME
@@ -101,9 +132,9 @@ def get_latest(df):
 
 ## Load train data
 df = pd.read_csv(data)
+df = df.sort_values(by=['patient_pseudo_id'], ascending=True).reset_index(drop=True)
 if LATEST:
     df = get_latest(df)
-
 print('Train data:', df.shape)
 print(df.head(20))
 print('Number of images:', df.shape[0])
@@ -112,11 +143,17 @@ print('Survived:', df[df.Died == 0].shape[0])
 
 ## Load test data
 test_df = pd.read_csv(test_data)
+test_df = test_df.dropna(subset=['Filename'])
+test_df['Filename'] = '/nfs/home/pedro/COVID/GSTT_JPGs_All/' + test_df['Filename'].astype(str)
+test_df = test_df[test_df.Time_Mismatch < 2]
+test_df = test_df.reset_index(drop=True)
 if LATEST:
     test_df = get_latest(test_df)
 print('Test data:', test_df.shape)
-tmp = test_df.drop(columns=['patient_pseudo_id','CXR_datetime','Age','Gender','Ethnicity','Died'])
+print(test_df.head(20))
+tmp = test_df.drop(columns=['patient_pseudo_id','CXR_datetime','Age','Gender','Ethnicity','Died','Time_Mismatch','Filename'])
 bloods_cols = tmp.columns
+#bloods_cols = ['Height', 'Weight', 'BMI', 'Albumin', 'Bilirubin', 'Creatinine', 'CRP']
 print('Bloods:', bloods_cols)
 
 def new_section(text):
@@ -124,17 +161,33 @@ def new_section(text):
     print(100 * '*')
     print(text)
 
-def prepare_data(df, bloods_cols):
+def prepare_data(df, bloods_cols, scaler, fit_scaler=False):
     print('Preparing data')
-    ## Replace data
+    ## Gender
+    df['Male'] = 0
+    df['Female'] = 0
+    df.loc[df['Gender'] == 1, 'Male'] = 1
+    df.loc[df['Gender'] == 0, 'Female'] = 1
+    ## Age
     df.Age.replace(120, np.nan, inplace=True)
-    df.Ethnicity.replace('Unknown', np.nan, inplace=True)
-    df.Ethnicity.replace('White', 1, inplace=True)
-    df.Ethnicity.replace('Black', 2, inplace=True)
-    df.Ethnicity.replace('Asian', 3, inplace=True)
-    df.Ethnicity.replace('Mixed', 4, inplace=True)
-    df.Ethnicity.replace('Other', 5, inplace=True)
-
+    ## Ethnicity
+    df.Ethnicity.replace(np.nan, 'Unknown', inplace=True)
+    #df.Ethnicity.replace('Unknown', np.nan, inplace=True)
+    #df.Ethnicity.replace('White', 1, inplace=True)
+    #df.Ethnicity.replace('Black', 2, inplace=True)
+    #df.Ethnicity.replace('Asian', 3, inplace=True)
+    #df.Ethnicity.replace('Mixed', 4, inplace=True)
+    #df.Ethnicity.replace('Other', 5, inplace=True)
+    df['White'] = 0
+    df['Black'] = 0
+    df['Asian'] = 0
+    df['Mixed'] = 0
+    df['Other'] = 0
+    df.loc[df['Ethnicity'] == 'White', 'White'] = 1
+    df.loc[df['Ethnicity'] == 'Black', 'Black'] = 1
+    df.loc[df['Ethnicity'] == 'Asian', 'Asian'] = 1
+    df.loc[df['Ethnicity'] == 'Mixed', 'Mixed'] = 1
+    df.loc[df['Ethnicity'] == 'Other', 'Other'] = 1
     # Compute relative timestamps
     df_tmp = df.pop('CXR_datetime')
     df['CXR_datetime'] = df_tmp
@@ -147,14 +200,15 @@ def prepare_data(df, bloods_cols):
     bloods = df.loc[:,bloods_cols].values.astype(np.float32)
     print('Bloods', bloods.shape)
     age = df.Age.values[:,None]
-    gender = df.Gender.values[:,None]
-    ethnicity = df.Ethnicity.values[:,None]
+    #gender = df.Gender.values[:,None]
+    #ethnicity = df.Ethnicity.values[:,None]
     time = df.rel_datetime.values[:,None]
 
     # Normalise features
-    scaler = StandardScaler()
-    X = np.concatenate((bloods, age, gender, ethnicity, time), axis=1)
-    scaler.fit(X)
+    #X = np.concatenate((bloods, age, gender, ethnicity, time), axis=1)
+    X = np.concatenate((bloods, age, time), axis=1)
+    if fit_scaler:
+        scaler.fit(X)
     X = scaler.transform(X)
 
     # Fill missing
@@ -169,9 +223,10 @@ def prepare_data(df, bloods_cols):
     # Put back features
     df.loc[:,bloods_cols] = X[:,0:bloods.shape[1]]
     df.loc[:,'Age'] = X[:,bloods.shape[1]]
-    df.loc[:,'Gender'] = X[:,bloods.shape[1]+1]
-    df.loc[:,'Ethnicity'] = X[:,bloods.shape[1]+2]
-    df.loc[:,'rel_datetime'] = X[:,bloods.shape[1]+3]
+    #df.loc[:,'Gender'] = X[:,bloods.shape[1]+1]
+    #df.loc[:,'Ethnicity'] = X[:,bloods.shape[1]+2]
+    #df.loc[:,'rel_datetime'] = X[:,bloods.shape[1]+3]
+    df.loc[:,'rel_datetime'] = X[:,bloods.shape[1]+1]
     return df
 
 def default_image_loader(path):
@@ -205,13 +260,22 @@ def rand_bbox(size, lam):
     return bbx1, bby1, bbx2, bby2
 
 def get_feats(df, i, aug=False):
+    #age = df.Age[i].astype(np.float32)
+    #gender = df.Gender[i].astype(np.float32)
+    #ethnicity = df.Ethnicity[i].astype(np.float32)
+    male = df.Male[i].astype(np.float32)
+    female = df.Female[i].astype(np.float32)
     age = df.Age[i].astype(np.float32)
-    gender = df.Gender[i].astype(np.float32)
-    ethnicity = df.Ethnicity[i].astype(np.float32)
+    white = df.White[i].astype(np.float32)
+    black = df.Black[i].astype(np.float32)
+    asian = df.Asian[i].astype(np.float32)
+    mixed = df.Mixed[i].astype(np.float32)
+    other = df.Other[i].astype(np.float32)
     bloods = df.loc[i, bloods_cols].values.astype(np.float32)
     if aug:
-        bloods += np.random.normal(0, 0.2, bloods.shape)
-    feats = np.concatenate((bloods, [age, gender, ethnicity]), axis=0)
+        bloods += np.random.normal(0, blood_aug, bloods.shape)
+    #feats = np.concatenate((bloods, [age, gender, ethnicity]), axis=0)
+    feats = np.concatenate((bloods, [male, female, age, white, black, asian, mixed, other]), axis=0)
     return feats
 
 def get_image(df, i, transform, A_transform=None):
@@ -229,29 +293,44 @@ def get_image(df, i, transform, A_transform=None):
     return image
 
 class SingleImageDataset(Dataset):
-    def __init__(self, my_df, transform, A_transform=None):
+    def __init__(self, my_df, transform, A_transform=None, unique=False):
         self.df = my_df
+        self.unique_df = self.df.drop_duplicates(subset='patient_pseudo_id').reset_index(drop=True)
         self.loader = default_image_loader
         self.transform = transform
         self.A_transform = A_transform
+        self.unique = unique
 
     def __getitem__(self, index):
         image, feats = np.array([]), np.array([])
-        pid = self.df.patient_pseudo_id[index]
-        # Image
-        if IMAGES:
-            image = get_image(self.df, index, self.transform, self.A_transform)
-        # Features
-        if FEATS:
-            feats = get_feats(self.df, index, aug=True)
-            time = self.df.rel_datetime[index].astype(np.float32)
-            feats = np.append(feats, time)
-        # Label
-        label = self.df.Died[index]
+        if self.unique:
+            pid = self.unique_df.patient_pseudo_id[index]
+            pid_df = self.df[self.df['patient_pseudo_id']==pid].reset_index(drop=True)
+            pid_df = pid_df.loc[np.random.choice(pid_df.shape[0], 1, replace=True)].reset_index(drop=True)
+            if IMAGES:
+                image = get_image(pid_df, 0, self.transform, self.A_transform)
+            if FEATS:
+                feats = get_feats(pid_df, 0, aug=True)
+                time = pid_df.rel_datetime[0].astype(np.float32)
+                feats = np.append(feats, time)
+            label = pid_df.Died[0]
+
+        else:
+            pid = self.df.patient_pseudo_id[index]
+            if IMAGES:
+                image = get_image(self.df, index, self.transform, self.A_transform)
+            if FEATS:
+                feats = get_feats(self.df, index, aug=True)
+                time = self.df.rel_datetime[index].astype(np.float32)
+                feats = np.append(feats, time)
+            label = self.df.Died[index]
         return pid, image, feats, label
 
     def __len__(self):
-        return self.df.shape[0]
+        if self.unique:
+            return self.unique_df.shape[0]
+        else:
+            return self.df.shape[0]
 
 
 class ImageDataset(Dataset):
@@ -313,7 +392,7 @@ class Swish_Module(nn.Module):
         return Swish.apply(x)
 
 class SingleModel(nn.Module):
-    def __init__(self, encoder='efficientnet-b0', nfeats=33):
+    def __init__(self, encoder='efficientnet-b0', nfeats=38):
         super(SingleModel, self).__init__()
         n_channels_dict = {'efficientnet-b0': 1280, 'efficientnet-b1': 1280, 'efficientnet-b2': 1408,
                            'efficientnet-b3': 1536, 'efficientnet-b4': 1792, 'efficientnet-b5': 2048,
@@ -336,8 +415,8 @@ class SingleModel(nn.Module):
             self.avg_pool = nn.AdaptiveAvgPool2d(1)
             self.out_chns += n_channels_dict[encoder]
         if FEATS:
-            hidden1 = 128
-            hidden2 = 128
+            hidden1 = chns
+            hidden2 = chns
             self.out_chns += hidden2
             self.fc1 = nn.Linear(nfeats, hidden1, bias=False)
             self.fc2 = nn.Linear(hidden1, hidden2, bias=False)
@@ -345,7 +424,7 @@ class SingleModel(nn.Module):
                                       nn.BatchNorm1d(hidden1),
                                       #nn.ReLU(),
                                       Swish_Module(),
-                                      nn.Dropout(p=0.5),
+                                      nn.Dropout(p=dp),
                                       self.fc2,
                                       nn.BatchNorm1d(hidden2),)
 
@@ -368,10 +447,10 @@ class CombinedModel(nn.Module):
         nchns = self.singlemodel.out_chns
         if MULTI:
             nchns *= 2
-        hidden1 = 128
+        hidden1 = chns
         self.classifier = nn.Sequential( #nn.ReLU(),
                                         Swish_Module(),
-                                        nn.Dropout(p=0.5),
+                                        nn.Dropout(p=dp),
                                         nn.Linear(nchns, hidden1),
                                         #nn.ReLU(),
                                         Swish_Module(),)
@@ -504,6 +583,8 @@ val_labels = []
 val_names = []
 val_acc = []
 val_auc = []
+val_folds = []
+scalers = []
 
 ## Fold loop
 for fold in range(FOLDS):
@@ -514,8 +595,9 @@ for fold in range(FOLDS):
     val_df = df[df.fold == fold].reset_index(drop=True, inplace=False)
 
     ## Prepare data
-    train_df = prepare_data(train_df, bloods_cols).reset_index(drop=True, inplace=False)
-    val_df = prepare_data(val_df, bloods_cols).reset_index(drop=True, inplace=False)
+    scaler = StandardScaler()
+    train_df = prepare_data(train_df, bloods_cols, scaler, fit_scaler=True).reset_index(drop=True, inplace=False)
+    val_df = prepare_data(val_df, bloods_cols, scaler, fit_scaler=False).reset_index(drop=True, inplace=False)
 
     print('Train', train_df.shape)
     print('Valid', val_df.shape)
@@ -524,18 +606,18 @@ for fold in range(FOLDS):
     if MULTI:
         train_dataset = ImageDataset(train_df, train_transform, A_transform)
     else:
-        train_dataset = SingleImageDataset(train_df, train_transform, A_transform)
+        train_dataset = SingleImageDataset(train_df, train_transform, A_transform, unique=True)
     train_loader = DataLoader(train_dataset, batch_size=bs, num_workers=4, shuffle=True, drop_last=True)
 
     ## Val dataser
-    val_dataset = SingleImageDataset(val_df, tta_transform)
+    val_dataset = SingleImageDataset(val_df, tta_transform, A_transform=None, unique=False)
     val_loader = DataLoader(val_dataset, batch_size=8, num_workers=4)
 
     ## Init model
     singlemodel = SingleModel(encoder).cuda()
     model = CombinedModel(singlemodel).cuda()
     model = nn.DataParallel(model)
-    optimizer = RangerLars(model.parameters())
+    optimizer = RangerLars(model.parameters(), lr=LR)
 
     alpha = train_df[train_df.Died==0].shape[0]/train_df.shape[0]
     print('Alpha', alpha)
@@ -615,10 +697,11 @@ for fold in range(FOLDS):
 
         # Scores
         y_true = np.array(res_label)
-        y_scores = np.array(res_prob)
-        auc = roc_auc_score(y_true, y_scores)
-        ap = average_precision_score(y_true, y_scores)
-        print("Epoch: {}, Loss: {}, Train Accuracy: {}, AUC: {}".format(epoch, running_loss, round(correct/total, 4), auc))
+        y_pred = np.array(res_prob)
+        auc = roc_auc_score(y_true, y_pred)
+        ap = average_precision_score(y_true, y_pred)
+        acc = balanced_accuracy_score(y_true, (y_pred>0.5).astype(int))
+        print("Epoch: {}, Loss: {}, Train Accuracy: {}, AUC: {}".format(epoch, running_loss, round(acc, 4), round(auc, 4)))
 
         # Tensorboard
         #grid = torchvision.utils.make_grid(images, nrow=4, normalize=True, scale_each=True)
@@ -636,72 +719,69 @@ for fold in range(FOLDS):
         print('\nValidation step')
         model.eval()
         running_loss = 0
-        correct = 0
-        total = 0
-        res_name = []
-        res_prob = []
-        res_label = []
-        count = 0
+        correct, total = 0, 0
+        res_name, res_prob, res_label = [], [], []
         with torch.no_grad():
             if MULTI:
                 for pid in val_df['patient_pseudo_id'].unique():
-                    #print(pid)
                     pid_df = val_df[val_df['patient_pseudo_id']==pid].reset_index(drop=True)
                     pid_df['CXR_datetime'] = pd.to_datetime(pid_df.CXR_datetime, dayfirst=True)
                     pid_df = pid_df.sort_values(by=['CXR_datetime'], ascending=True).reset_index(drop=True)
                     n_images = pid_df.shape[0]
-                    ind1=0
-                    ind2=n_images-1
-                    time1 = pid_df.rel_datetime[ind1].astype(np.float32)
-                    time2 = pid_df.rel_datetime[ind2].astype(np.float32)
-                    image1, image2 = np.array([]), np.array([])
-                    feats1, feats2 = np.array([]), np.array([])
-                    if FEATS:
-                        # Features
-                        feats1 = get_feats(pid_df, ind1, aug=False)
-                        feats2 = get_feats(pid_df, ind2, aug=False)
-                        feats1 = np.append(feats1, time1)
-                        feats2 = np.append(feats2, time2)
-                    else:
+                    if VAL_MODE == 'ALL':
+                        inds = range(n_images)
+                    elif VAL_MODE == 'FIRST_LAST':
+                        inds = [0, n_images-1]
+                    elif VAL_MODE == 'LATEST':
+                        inds = [n_images-1, n_images-1]
+                    n = len(inds)
+                    for i in range(n):
+                        ind1 = inds[0] # Always first image
+                        ind2 = inds[i] # Next image
+                        time1 = pid_df.rel_datetime[ind1].astype(np.float32)
+                        time2 = pid_df.rel_datetime[ind2].astype(np.float32)
+                        image1, image2 = np.array([]), np.array([])
                         feats1, feats2 = np.array([]), np.array([])
-                    if IMAGES:
-                        # Image
-                        image1 = get_image(pid_df, ind1, tta_transform)
-                        image2 = get_image(pid_df, ind2, tta_transform)
-                    else:
-                        image1, image2 = torch.FloatTensor(), torch.FloatTensor()
-                    # Label
-                    labels = pid_df.Died[ind1]
-                    labels = torch.Tensor([labels]).cuda()
-
-                    image1, image2 = image1.cuda(), image2.cuda()
-                    image1, image2 = image1.unsqueeze(0), image2.unsqueeze(0)
-                    feats1, feats2 = torch.Tensor(feats1).cuda(), torch.Tensor(feats2).cuda()
-                    feats1, feats2 = feats1.unsqueeze(0), feats2.unsqueeze(0)
-                    labels = labels.unsqueeze(1).float()
-                    #print(image1.shape, image2.shape, feats1.shape, feats2.shape, labels.shape)
-
-                    ## TTA
-                    if len(image1.size())==5:
-                        batch_size, n_crops, c, h, w = image1.size()
-                        image1 = image1.view(-1, c, h, w)
-                        image2 = image2.view(-1, c, h, w)
                         if FEATS:
-                            _, n_feats = feats1.size()
-                            feats1 = feats1.repeat(1,n_crops).view(-1,n_feats)
-                            feats2 = feats2.repeat(1,n_crops).view(-1,n_feats)
-                        out = model(image1, feats1, image2, feats2)
-                        out = out.view(batch_size, n_crops, -1).mean(1)
-                    else:
-                        out = model(image1, feats1, image2, feats2)
-                    loss = sigmoid_focal_loss(out, labels, alpha=alpha, gamma=gamma, reduction="mean")
-                    running_loss += loss.item()
-                    total += labels.size(0)
-                    out = torch.sigmoid(out)
-                    correct += ((out > 0.5).int() == labels).sum().item()
-                    res_prob += out.cpu().numpy().tolist()
-                    res_label += labels.cpu().numpy().tolist()
-                    res_name += [pid]
+                            feats1 = get_feats(pid_df, ind1, aug=False)
+                            feats2 = get_feats(pid_df, ind2, aug=False)
+                            feats1 = np.append(feats1, time1)
+                            feats2 = np.append(feats2, time2)
+                        else:
+                            feats1, feats2 = np.array([]), np.array([])
+                        if IMAGES:
+                            image1 = get_image(pid_df, ind1, tta_transform)
+                            image2 = get_image(pid_df, ind2, tta_transform)
+                        else:
+                            image1, image2 = torch.FloatTensor(), torch.FloatTensor()
+                        labels = pid_df.Died[ind1]
+                        labels = torch.Tensor([labels]).cuda()
+                        image1, image2 = image1.cuda(), image2.cuda()
+                        image1, image2 = image1.unsqueeze(0), image2.unsqueeze(0)
+                        feats1, feats2 = torch.Tensor(feats1).cuda(), torch.Tensor(feats2).cuda()
+                        feats1, feats2 = feats1.unsqueeze(0), feats2.unsqueeze(0)
+                        labels = labels.unsqueeze(1).float()
+                        ## TTA
+                        if len(image1.size())==5:
+                            batch_size, n_crops, c, h, w = image1.size()
+                            image1 = image1.view(-1, c, h, w)
+                            image2 = image2.view(-1, c, h, w)
+                            if FEATS:
+                                _, n_feats = feats1.size()
+                                feats1 = feats1.repeat(1,n_crops).view(-1,n_feats)
+                                feats2 = feats2.repeat(1,n_crops).view(-1,n_feats)
+                            out = model(image1, feats1, image2, feats2)
+                            out = out.view(batch_size, n_crops, -1).mean(1)
+                        else:
+                            out = model(image1, feats1, image2, feats2)
+                        loss = sigmoid_focal_loss(out, labels, alpha=alpha, gamma=gamma, reduction="mean")
+                        running_loss += loss.item()
+                        out = torch.sigmoid(out).item()
+                        correct += int(int(out>0.5)==labels.item())
+                        total += 1
+                        res_prob += [out]
+                        res_label += [labels.item()]
+                        res_name += [pid]
             else:
                 for i, sample in enumerate(val_loader):
                     pid = sample[0]
@@ -724,22 +804,25 @@ for fold in range(FOLDS):
                     running_loss += loss.item()
                     total += labels.size(0)
                     out = torch.sigmoid(out)
-                    correct += ((out > 0.5).int() == labels).sum().item()
+                    correct += ((out>0.5).int() == labels).sum().item()
                     res_prob += out.cpu().numpy().tolist()
                     res_label += labels.cpu().numpy().tolist()
                     res_name += pid
+                res_prob = [x[0] for x in res_prob]
+                res_label = [x[0] for x in res_label]
 
         # Scores
-        acc = correct/total
         y_true = np.array(res_label)
-        y_scores = np.array(res_prob)
-        auc = roc_auc_score(y_true, y_scores)
-        ap = average_precision_score(y_true, y_scores)
+        y_pred = np.array(res_prob)
+        auc = roc_auc_score(y_true, y_pred)
+        ap = average_precision_score(y_true, y_pred)
+        acc = balanced_accuracy_score(y_true, (y_pred>0.5).astype(int))
         running_auc.append(auc)
         running_acc.append(acc)
-        running_preds.append(y_scores)
+        running_preds.append(y_pred)
         id = int(np.argmax(running_auc))
-        print("Epoch: {}, Loss: {}, Test Accuracy: {}, AUC: {}".format(epoch, running_loss, round(acc, 4), auc))
+        best_epoch = id
+        print("Epoch: {}, Loss: {}, Test Accuracy: {}, AUC: {}".format(epoch, running_loss, round(acc, 4), round(auc, 4)))
         print('All AUC:', running_auc)
         print('Best Result -- Epoch:', id, 'AUC:', running_auc[id], 'Accuracy:', running_acc[id])
 
@@ -767,6 +850,7 @@ for fold in range(FOLDS):
             val_auc += [running_auc[id]]
             val_labels += res_label
             val_names += res_name
+            val_folds += len(res_name)*[fold]
             if SAVE:
                 MODEL_PATH = os.path.join(SAVE_PATH, ('fold_%d_epoch_%d.pth' % (fold, epoch)))
                 torch.save(model.state_dict(), MODEL_PATH)
@@ -813,10 +897,9 @@ val_preds = np.array(val_preds)
 val_auc = np.array(val_auc)
 val_acc = np.array(val_acc)
 print('Labels:', len(val_labels), 'Preds:', len(val_preds), 'Names:', len(val_names), 'AUCs:', len(val_auc))
-correct = ((val_preds > 0.5).astype(int) == val_labels).sum()
-acc = correct / len(val_labels)
+acc = balanced_accuracy_score(val_labels, (val_preds>0.5).astype(int))
 auc = roc_auc_score(val_labels, val_preds)
-print("Total Accuracy: {}, AUC: {}".format(round(acc, 4), auc))
+print("Total Accuracy: {}, AUC: {}".format(round(acc,4), round(auc,4)))
 print('Accuracy mean:', np.mean(val_acc), 'std:', np.std(val_acc))
 print('AUC mean:', np.mean(val_auc), 'std:', np.std(val_auc))
 
@@ -849,25 +932,26 @@ plt.legend(loc="lower right")
 plt.savefig(os.path.join(SAVE_PATH,'precision-recall-' + SAVE_NAME + '.png'), dpi=300)
 
 ## Preds dataframe
-val_labels = [x[0] for x in val_labels]
-val_preds = [x[0] for x in val_preds]
-sub = pd.DataFrame({"Filename":val_names, "Died":val_labels, "Pred":val_preds})
-sub.to_csv(os.path.join(SAVE_PATH,'preds-' + SAVE_NAME + '.csv'), index=False)
+sub = pd.DataFrame({"Filename":val_names, "Died":val_labels, "Pred":val_preds, "Fold":val_folds})
+sub.to_csv(os.path.join(SAVE_PATH,'preds-KCH-' + SAVE_NAME + '.csv'), index=False)
 
 
 
 ## Test
 new_section('Testing!')
-test_df = prepare_data(test_df, bloods_cols)
+print(SAVE_NAME)
+scaler = StandardScaler()
+test_df = prepare_data(test_df, bloods_cols, scaler, fit_scaler=True)
 print('Test data:', test_df.shape)
 
 if not MULTI:
-    test_dataset = SingleImageDataset(test_df, tta_transform)
+    test_dataset = SingleImageDataset(test_df, tta_transform, unique=False)
     test_loader = DataLoader(test_dataset, batch_size=8, num_workers=4)
 
 y_pred = 0
 test_accs = []
 test_aucs = []
+sub = pd.DataFrame(columns=['Filename','Died','Pred'])
 for fold in range(FOLDS):
     print('\nFOLD', fold)
 
@@ -887,54 +971,54 @@ for fold in range(FOLDS):
                 pid_df['CXR_datetime'] = pd.to_datetime(pid_df.CXR_datetime, dayfirst=True)
                 pid_df = pid_df.sort_values(by=['CXR_datetime'], ascending=True).reset_index(drop=True)
                 n_images = pid_df.shape[0]
-                ind1 = 0
-                ind2 = n_images-1
-                time1 = pid_df.rel_datetime[ind1].astype(np.float32)
-                time2 = pid_df.rel_datetime[ind2].astype(np.float32)
-                image1, image2 = np.array([]), np.array([])
-                feats1, feats2 = np.array([]), np.array([])
-                if FEATS:
-                    # Features
-                    feats1 = get_feats(pid_df, ind1, aug=False)
-                    feats2 = get_feats(pid_df, ind2, aug=False)
-                    feats1 = np.append(feats1, time1)
-                    feats2 = np.append(feats2, time2)
-                else:
+                if VAL_MODE == 'ALL':
+                    inds = range(n_images)
+                elif VAL_MODE == 'FIRST_LAST':
+                    inds = [0, n_images-1]
+                elif VAL_MODE == 'LATEST':
+                    inds = [n_images-1, n_images-1]
+                n = len(inds)
+                for i in range(n):
+                    ind1 = inds[0] # Always first image
+                    ind2 = inds[i] # Next image
+                    time1 = pid_df.rel_datetime[ind1].astype(np.float32)
+                    time2 = pid_df.rel_datetime[ind2].astype(np.float32)
+                    image1, image2 = np.array([]), np.array([])
                     feats1, feats2 = np.array([]), np.array([])
-                if IMAGES:
-                    # Image
-                    image1 = get_image(pid_df, ind1, tta_transform)
-                    image2 = get_image(pid_df, ind2, tta_transform)
-                else:
-                    image1, image2 = torch.FloatTensor(), torch.FloatTensor()
-                # Label
-                labels = pid_df.Died[ind1]
-                labels = torch.Tensor([labels]).cuda()
-                image1, image2 = image1.cuda(), image2.cuda()
-                image1, image2 = image1.unsqueeze(0), image2.unsqueeze(0)
-                feats1, feats2 = torch.Tensor(feats1).cuda(), torch.Tensor(feats2).cuda()
-                feats1, feats2 = feats1.unsqueeze(0), feats2.unsqueeze(0)
-                labels = labels.unsqueeze(1).float()
-                #print(image1.shape, image2.shape, feats1.shape, feats2.shape, labels.shape)
-
-                ## TTA
-                if len(image1.size())==5:
-                    batch_size, n_crops, c, h, w = image1.size()
-                    image1 = image1.view(-1, c, h, w)
-                    image2 = image2.view(-1, c, h, w)
                     if FEATS:
-                        _, n_feats = feats1.size()
-                        feats1 = feats1.repeat(1,n_crops).view(-1,n_feats)
-                        feats2 = feats2.repeat(1,n_crops).view(-1,n_feats)
-                    out = model(image1, feats1, image2, feats2)
-                    out = out.view(batch_size, n_crops, -1).mean(1)
-                else:
-                    out = model(image1, feats1, image2, feats2)
-
-                out = torch.sigmoid(out)
-                res_prob += out.cpu().numpy().tolist()
-                res_label += labels.cpu().numpy().tolist()
-                res_name += [pid]
+                        feats1 = get_feats(pid_df, ind1, aug=False)
+                        feats2 = get_feats(pid_df, ind2, aug=False)
+                        feats1 = np.append(feats1, time1)
+                        feats2 = np.append(feats2, time2)
+                    else:
+                        feats1, feats2 = np.array([]), np.array([])
+                    if IMAGES:
+                        image1 = get_image(pid_df, ind1, tta_transform)
+                        image2 = get_image(pid_df, ind2, tta_transform)
+                    else:
+                        image1, image2 = torch.FloatTensor(), torch.FloatTensor()
+                    labels = pid_df.Died[ind1]
+                    image1, image2 = image1.cuda(), image2.cuda()
+                    image1, image2 = image1.unsqueeze(0), image2.unsqueeze(0)
+                    feats1, feats2 = torch.Tensor(feats1).cuda(), torch.Tensor(feats2).cuda()
+                    feats1, feats2 = feats1.unsqueeze(0), feats2.unsqueeze(0)
+                    ## TTA
+                    if len(image1.size())==5:
+                        batch_size, n_crops, c, h, w = image1.size()
+                        image1 = image1.view(-1, c, h, w)
+                        image2 = image2.view(-1, c, h, w)
+                        if FEATS:
+                            _, n_feats = feats1.size()
+                            feats1 = feats1.repeat(1,n_crops).view(-1,n_feats)
+                            feats2 = feats2.repeat(1,n_crops).view(-1,n_feats)
+                        out = model(image1, feats1, image2, feats2)
+                        out = out.view(batch_size, n_crops, -1).mean(1)
+                    else:
+                        out = model(image1, feats1, image2, feats2)
+                    out = torch.sigmoid(out).item()
+                    res_prob += [out]
+                    res_label += [labels]
+                    res_name += [pid]
         else:
             for i, sample in enumerate(test_loader):
                 pid = sample[0]
@@ -956,21 +1040,24 @@ for fold in range(FOLDS):
                 out = torch.sigmoid(out)
                 res_prob += out.cpu().numpy().tolist()
                 res_label += labels.cpu().numpy().tolist()
-                res_name += pid
+                res_name += pid.cpu().numpy().tolist()
+            res_prob = [x[0] for x in res_prob]
+            res_label = [x[0] for x in res_label]
 
         res_label = np.array(res_label)
         res_prob = np.array(res_prob)
         test_auc = roc_auc_score(res_label, res_prob)
-        test_acc = accuracy_score(res_label, (res_prob>0.5).astype(int))
+        test_acc = balanced_accuracy_score(res_label, (res_prob>0.5).astype(int))
         test_accs.append(test_acc)
         test_aucs.append(test_auc)
         print('Accuracy:', test_acc, 'AUC:', test_auc)
         y_pred += res_prob
+        sub['Fold %d' % fold] = res_prob
 
 # Test scores
 y_pred /= FOLDS
 y_true = np.array(res_label)
-acc = accuracy_score(y_true, (y_pred>0.5).astype(int))
+acc = balanced_accuracy_score(y_true, (y_pred>0.5).astype(int))
 auc = roc_auc_score(y_true, y_pred)
 ap = average_precision_score(y_true, y_pred)
 test_accs = np.array(test_accs)
@@ -978,3 +1065,22 @@ test_aucs = np.array(test_aucs)
 print('\nOverall Accuracy:', acc, 'AUC:', auc)
 print('Accuracy mean:', np.mean(test_accs), 'std:', np.std(test_accs))
 print('AUC mean:', np.mean(test_aucs), 'std:', np.std(test_aucs))
+sub['Filename'] = res_name
+sub['Died'] = y_true
+sub['Pred'] = y_pred
+sub.to_csv(os.path.join(SAVE_PATH,'preds-GSTT-' + SAVE_NAME + '.csv'), index=False)
+
+## Report
+val_acc_mean = np.asscalar(np.mean(val_acc))
+val_acc_std = np.asscalar(np.std(val_acc))
+val_auc_mean = np.asscalar(np.mean(val_auc))
+val_auc_std = np.asscalar(np.std(val_auc))
+
+test_acc_mean = np.asscalar(np.mean(test_accs))
+test_acc_std = np.asscalar(np.std(test_accs))
+test_auc_mean = np.asscalar(np.mean(test_aucs))
+test_auc_std = np.asscalar(np.std(test_aucs))
+runai.hpo.report(epoch=best_epoch, metrics={ 'val_acc':val_acc_mean, 'val_acc_std':val_acc_std,
+                                             'val_auc':val_auc_mean, 'val_auc_std':val_auc_std,
+                                             'test_acc':test_acc_mean, 'test_acc_std':test_acc_std,
+                                             'test_auc':test_auc_mean, 'test_auc_std':test_auc_std })
